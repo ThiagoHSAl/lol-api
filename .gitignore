@@ -1,0 +1,11 @@
+# Ignora absolutamente tudo por padrão
+*
+
+# Não ignora pastas (necessário para o Git procurar arquivos dentro delas)
+!*/
+
+# Abre exceção para arquivos Python e o próprio .gitignore
+!.gitignore
+!*.py
+venv/
+__pycache__/
