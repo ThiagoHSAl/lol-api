@@ -172,7 +172,7 @@ def iniciar_crawler_apex():
                                     p.get('totalHeal', 0), p.get('damageSelfMitigated', 0), p.get('longestTimeSpentLiving', 0), 1 if p.get('firstBloodKill') else 0, 1 if p.get('firstBloodAssist') else 0,
                                     # AQUI A CORREÇÃO: SOMA DOS PINGS DE PERIGO REAIS
                                     (p.get('getBackPings', 0) + p.get('dangerPings', 0)), p.get('assistMePings', 0), p.get('enemyMissingPings', 0),
-                                    chal.get('kpa', 0), chal.get('skillshotsDodged', 0), chal.get('soloKills', 0), chal.get('jungleCsBefore10Minutes', 0), chal.get('laneMinionsFirst10Minutes', 0), chal.get('teamDamagePercentage', 0)
+                                    chal.get('killParticipation', 0), chal.get('skillshotsDodged', 0), chal.get('soloKills', 0), chal.get('jungleCsBefore10Minutes', 0), chal.get('laneMinionsFirst10Minutes', 0), chal.get('teamDamagePercentage', 0)
                                 ))                            
                             cursor.execute("INSERT INTO partidas_processadas VALUES (?)", (m_id,))
                             conn.commit()

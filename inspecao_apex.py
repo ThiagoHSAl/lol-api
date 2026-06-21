@@ -101,7 +101,7 @@ for elo_nome, endpoint in elos_apex.items():
         "pings_perigo": p.get('dangerPings', 0),
         "pings_ajuda": p.get('assistMePings', 0),
         "pings_mia": p.get('enemyMissingPings', 0),
-        "kpa": round(chal.get('kpa', 0), 3),
+        "kpa": round(chal.get('killParticipation', 0), 3),
         "skillshots_desviadas": chal.get('skillshotsDodged', 0),
         "solo_kills": chal.get('soloKills', 0),
         "cs_jungle_10m": chal.get('jungleCsBefore10Minutes', 0),
