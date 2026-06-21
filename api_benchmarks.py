@@ -10,6 +10,9 @@ app = FastAPI(title="LoL AI Tutor - Benchmarks API")
 
 ARQUIVO_CACHE = "cache_benchmarks.json"
 ARQUIVO_CACHE_PANORAMA = "cache_panorama.json"
+ARQUIVO_CACHE_ROTA = "cache_benchmarks_rota.json"
+
+POSICOES_VALIDAS = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 
 # ==========================================
 # ORDEM HIERÁRQUICA DO LEAGUE OF LEGENDS
@@ -52,6 +55,87 @@ def obter_todos_os_benchmarks():
             dados_ordenados[chave] = dados_brutos[chave]
             
     return dados_ordenados
+
+# ==========================================
+# BENCHMARKS POR ROTA (PERSONALIZADO POR FUNÇÃO)
+# Declarados ANTES de /benchmarks/{elo} para o prefixo literal "rota"
+# ter prioridade no roteamento do FastAPI.
+# ==========================================
+
+def ler_cache_rota():
+    if not os.path.exists(ARQUIVO_CACHE_ROTA):
+        raise HTTPException(status_code=503, detail="Aguarde. O cache por rota está sendo gerado pelo servidor.")
+
+    with open(ARQUIVO_CACHE_ROTA, "r") as f:
+        return json.load(f)
+
+def _validar_posicao(posicao: str) -> str:
+    posicao = posicao.upper()
+    if posicao not in POSICOES_VALIDAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Posição inválida. Use uma de: {', '.join(POSICOES_VALIDAS)}"
+        )
+    return posicao
+
+@app.get("/benchmarks/rota/{posicao}")
+def obter_benchmark_rota_todos(posicao: str):
+    """
+    Retorna o benchmark de uma rota em TODOS os elos (ordenados hierarquicamente).
+    Usado para o cálculo de elo equivalente e para avaliar os elos por rota.
+    """
+    posicao = _validar_posicao(posicao)
+    dados = ler_cache_rota()
+
+    resultado = {}
+    for chave in ORDEM_ELOS:
+        bloco = dados.get(chave, {})
+        if posicao in bloco:
+            resultado[chave] = bloco[posicao]
+
+    if not resultado:
+        raise HTTPException(status_code=404, detail="Nenhum benchmark encontrado para essa rota.")
+
+    return resultado
+
+@app.get("/benchmarks/rota/{posicao}/{elo}")
+@app.get("/benchmarks/rota/{posicao}/{elo}/{divisao}")
+def obter_benchmark_rota(posicao: str, elo: str, divisao: str = None):
+    """Benchmark de uma rota em um elo (apex ignora divisão; só-elo faz média de I..IV)."""
+    posicao = _validar_posicao(posicao)
+    dados = ler_cache_rota()
+    elo = elo.upper()
+
+    # Elos Apex: ignoram divisão
+    if elo in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
+        bloco = dados.get(f"{elo}_I", {})
+        if posicao in bloco:
+            return {"elo": elo, "posicao": posicao, "benchmark": bloco[posicao]}
+        raise HTTPException(status_code=404, detail="Benchmark não encontrado.")
+
+    # Elo + divisão específica
+    if divisao:
+        bloco = dados.get(f"{elo}_{divisao.upper()}", {})
+        if posicao in bloco:
+            return {"elo": elo, "divisao": divisao.upper(), "posicao": posicao, "benchmark": bloco[posicao]}
+        raise HTTPException(status_code=404, detail="Benchmark não encontrado.")
+
+    # Apenas elo → média das divisões I..IV que possuem a rota
+    blocos = [
+        dados[f"{elo}_{d}"][posicao]
+        for d in ["I", "II", "III", "IV"]
+        if f"{elo}_{d}" in dados and posicao in dados[f"{elo}_{d}"]
+    ]
+
+    if not blocos:
+        raise HTTPException(status_code=404, detail="Benchmark não encontrado.")
+
+    media = {}
+    for metrica in blocos[0].keys():
+        valores = [b[metrica] for b in blocos if metrica in b]
+        media[metrica] = round(sum(valores) / len(valores), 4)
+
+    return {"elo": elo, "posicao": posicao, "benchmark": media}
 
 @app.get("/benchmarks/{elo}")
 @app.get("/benchmarks/{elo}/{divisao}")

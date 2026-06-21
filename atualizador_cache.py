@@ -73,6 +73,55 @@ def atualizar_cache_benchmarks(conn):
         json.dump(resultado_json, f, indent=4)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Cache de Benchmarks Base atualizado!")
 
+def atualizar_cache_benchmarks_rota(conn):
+    """
+    Agrega os benchmarks por elo + divisao + POSICAO, com todas as metricas
+    relevantes a cada rota. Permite avaliar o jogador (e os elos) de forma
+    personalizada por funcao no mapa.
+    """
+    cursor = conn.cursor()
+    query = """
+        SELECT elo, divisao, posicao, COUNT(*) AS amostra,
+               AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min,
+               AVG(visao_min) AS visao_min, AVG(dano_min) AS dano_min,
+               AVG(dano_objetivos) AS dano_objetivos, AVG(dano_torres) AS dano_torres,
+               AVG(tempo_cc) AS tempo_cc, AVG(pink_wards) AS pink_wards,
+               AVG(cura_total) AS cura_total, AVG(dano_mitigado) AS dano_mitigado,
+               AVG(kpa) AS kpa, AVG(solo_kills) AS solo_kills,
+               AVG(cs_jungle_10m) AS cs_jungle_10m, AVG(cs_rota_10m) AS cs_rota_10m,
+               AVG(pct_dano_time) AS pct_dano_time
+        FROM estatisticas_meta
+        WHERE elo IS NOT NULL AND divisao IS NOT NULL
+          AND posicao IS NOT NULL AND posicao <> ''
+        GROUP BY elo, divisao, posicao
+        HAVING COUNT(*) >= 20
+    """
+    cursor.execute(query)
+    linhas = cursor.fetchall()
+
+    # Colunas numericas a expor (mesma uniao usada pelo frontend por rota)
+    metricas = [
+        "kda", "cs_min", "ouro_min", "visao_min", "dano_min", "dano_objetivos",
+        "dano_torres", "tempo_cc", "pink_wards", "cura_total", "dano_mitigado",
+        "kpa", "solo_kills", "cs_jungle_10m", "cs_rota_10m", "pct_dano_time",
+    ]
+
+    resultado_json = {}
+    for linha in linhas:
+        elo_completo = f"{linha['elo']}_{linha['divisao']}".upper()
+        posicao = str(linha["posicao"]).upper()
+
+        bloco = {"amostra": linha["amostra"]}
+        for m in metricas:
+            valor = linha[m]
+            bloco[m] = round(valor, 4) if valor is not None else 0.0
+
+        resultado_json.setdefault(elo_completo, {})[posicao] = bloco
+
+    with open("cache_benchmarks_rota.json", "w") as f:
+        json.dump(resultado_json, f, indent=4)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Cache de Benchmarks por Rota atualizado!")
+
 def atualizar_cache_panorama(conn, mapa_itens_finais):
     """Processa os Top 10 Campeões e a Build ideal apenas com itens completos."""
     cursor = conn.cursor()
@@ -146,6 +195,7 @@ def iniciar_agregacao():
             mapa_itens_finais = obter_mapa_de_itens_finais()
             
             atualizar_cache_benchmarks(conn)
+            atualizar_cache_benchmarks_rota(conn)
             atualizar_cache_panorama(conn, mapa_itens_finais)
             
             conn.close()
