@@ -78,54 +78,92 @@ def _validar_posicao(posicao: str) -> str:
         )
     return posicao
 
+# Métricas numéricas expostas por rota (mesma união usada pelo cache e pelo frontend).
+_METRICAS_ROTA = [
+    "kda", "cs_min", "ouro_min", "visao_min", "dano_min", "dano_objetivos",
+    "dano_torres", "tempo_cc", "pink_wards", "cura_total", "dano_mitigado",
+    "kpa", "solo_kills", "cs_jungle_10m", "cs_rota_10m", "pct_dano_time",
+]
+
+def _rota_bench_por_regiao(posicao: str, regiao: str) -> dict:
+    """Agrega o benchmark de uma rota por elo+divisão para UMA região, direto do DB.
+    Mesma forma do cache de rota fatiado por posição: { 'ELO_DIV': {amostra, kda, ...}, ... }."""
+    selects = ", ".join(f"AVG({m}) AS {m}" for m in _METRICAS_ROTA)
+    query = f"""
+        SELECT elo, divisao, COUNT(*) AS amostra, {selects}
+        FROM estatisticas_meta
+        WHERE elo IS NOT NULL AND divisao IS NOT NULL
+          AND posicao IS NOT NULL AND posicao <> ''
+          AND UPPER(posicao) = UPPER(?) AND UPPER(regiao) = UPPER(?)
+        GROUP BY elo, divisao
+        HAVING COUNT(*) >= 20
+    """
+    conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        linhas = conn.execute(query, (posicao, regiao)).fetchall()
+    finally:
+        conn.close()
+
+    resultado = {}
+    for linha in linhas:
+        chave = f"{linha['elo']}_{linha['divisao']}".upper()
+        bloco = {"amostra": linha["amostra"]}
+        for m in _METRICAS_ROTA:
+            valor = linha[m]
+            bloco[m] = round(valor, 4) if valor is not None else 0.0
+        resultado[chave] = bloco
+    return resultado
+
+def _bench_por_elo(posicao: str, regiao: str = None) -> dict:
+    """Retorna { 'ELO_DIV': {metricas} } de uma rota: por região (DB) ou global (cache)."""
+    if regiao:
+        return _rota_bench_por_regiao(posicao, regiao)
+    dados = ler_cache_rota()
+    return {chave: bloco[posicao] for chave, bloco in dados.items() if posicao in bloco}
+
 @app.get("/benchmarks/rota/{posicao}")
-def obter_benchmark_rota_todos(posicao: str):
+def obter_benchmark_rota_todos(posicao: str, regiao: Optional[str] = None):
     """
     Retorna o benchmark de uma rota em TODOS os elos (ordenados hierarquicamente).
     Usado para o cálculo de elo equivalente e para avaliar os elos por rota.
+    Com `?regiao=` (ex.: kr), agrega só aquela região direto do DB; sem ele, usa o cache global.
     """
     posicao = _validar_posicao(posicao)
-    dados = ler_cache_rota()
+    bench = _bench_por_elo(posicao, regiao)
 
-    resultado = {}
-    for chave in ORDEM_ELOS:
-        bloco = dados.get(chave, {})
-        if posicao in bloco:
-            resultado[chave] = bloco[posicao]
+    resultado = {chave: bench[chave] for chave in ORDEM_ELOS if chave in bench}
 
     if not resultado:
-        raise HTTPException(status_code=404, detail="Nenhum benchmark encontrado para essa rota.")
+        raise HTTPException(status_code=404, detail="Nenhum benchmark encontrado para essa rota/região.")
 
     return resultado
 
 @app.get("/benchmarks/rota/{posicao}/{elo}")
 @app.get("/benchmarks/rota/{posicao}/{elo}/{divisao}")
-def obter_benchmark_rota(posicao: str, elo: str, divisao: str = None):
-    """Benchmark de uma rota em um elo (apex ignora divisão; só-elo faz média de I..IV)."""
+def obter_benchmark_rota(posicao: str, elo: str, divisao: str = None, regiao: Optional[str] = None):
+    """Benchmark de uma rota em um elo (apex ignora divisão; só-elo faz média de I..IV).
+    Com `?regiao=` agrega só aquela região; sem ele, usa o cache global."""
     posicao = _validar_posicao(posicao)
-    dados = ler_cache_rota()
+    bench = _bench_por_elo(posicao, regiao)
     elo = elo.upper()
 
     # Elos Apex: ignoram divisão
     if elo in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
-        bloco = dados.get(f"{elo}_I", {})
-        if posicao in bloco:
-            return {"elo": elo, "posicao": posicao, "benchmark": bloco[posicao]}
+        bloco = bench.get(f"{elo}_I")
+        if bloco:
+            return {"elo": elo, "posicao": posicao, "benchmark": bloco}
         raise HTTPException(status_code=404, detail="Benchmark não encontrado.")
 
     # Elo + divisão específica
     if divisao:
-        bloco = dados.get(f"{elo}_{divisao.upper()}", {})
-        if posicao in bloco:
-            return {"elo": elo, "divisao": divisao.upper(), "posicao": posicao, "benchmark": bloco[posicao]}
+        bloco = bench.get(f"{elo}_{divisao.upper()}")
+        if bloco:
+            return {"elo": elo, "divisao": divisao.upper(), "posicao": posicao, "benchmark": bloco}
         raise HTTPException(status_code=404, detail="Benchmark não encontrado.")
 
     # Apenas elo → média das divisões I..IV que possuem a rota
-    blocos = [
-        dados[f"{elo}_{d}"][posicao]
-        for d in ["I", "II", "III", "IV"]
-        if f"{elo}_{d}" in dados and posicao in dados[f"{elo}_{d}"]
-    ]
+    blocos = [bench[f"{elo}_{d}"] for d in ["I", "II", "III", "IV"] if f"{elo}_{d}" in bench]
 
     if not blocos:
         raise HTTPException(status_code=404, detail="Benchmark não encontrado.")
