@@ -85,23 +85,27 @@ _METRICAS_ROTA = [
     "kpa", "solo_kills", "cs_jungle_10m", "cs_rota_10m", "pct_dano_time",
 ]
 
-def _rota_bench_por_regiao(posicao: str, regiao: str) -> dict:
-    """Agrega o benchmark de uma rota por elo+divisão para UMA região, direto do DB.
-    Mesma forma do cache de rota fatiado por posição: { 'ELO_DIV': {amostra, kda, ...}, ... }."""
-    selects = ", ".join(f"AVG({m}) AS {m}" for m in _METRICAS_ROTA)
+def _consultar_agregados(where_extra: str, params: list) -> dict:
+    """Núcleo comum: lê o benchmark a partir da tabela PRÉ-AGREGADA estatisticas_agregadas
+    (campeao,posicao,elo,divisao,regiao -> n + somas), combinando o que o filtro pedir.
+    AVG = SUM(soma_m)/SUM(n) — matematicamente idêntico ao AVG ao vivo, mas sobre uma
+    tabela de ~100k linhas (ms) em vez de varrer os ~4M de estatisticas_meta a cada request.
+    Retorna { 'ELO_DIV': {amostra, kda, ...}, ... }. Cai p/ {} se a tabela ainda não existe
+    (agregador não rodou) — o chamador trata o 404/fallback."""
+    medias = ", ".join(f"SUM(soma_{m}) / SUM(n) AS {m}" for m in _METRICAS_ROTA)
     query = f"""
-        SELECT elo, divisao, COUNT(*) AS amostra, {selects}
-        FROM estatisticas_meta
-        WHERE elo IS NOT NULL AND divisao IS NOT NULL
-          AND posicao IS NOT NULL AND posicao <> ''
-          AND UPPER(posicao) = UPPER(?) AND UPPER(regiao) = UPPER(?)
+        SELECT elo, divisao, SUM(n) AS amostra, {medias}
+        FROM estatisticas_agregadas
+        WHERE {where_extra}
         GROUP BY elo, divisao
-        HAVING COUNT(*) >= 20
+        HAVING SUM(n) >= 20
     """
     conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        linhas = conn.execute(query, (posicao, regiao)).fetchall()
+        linhas = conn.execute(query, params).fetchall()
+    except sqlite3.OperationalError:
+        return {}  # tabela agregada ainda não construída → fallback gracioso
     finally:
         conn.close()
 
@@ -114,6 +118,14 @@ def _rota_bench_por_regiao(posicao: str, regiao: str) -> dict:
             bloco[m] = round(valor, 4) if valor is not None else 0.0
         resultado[chave] = bloco
     return resultado
+
+def _rota_bench_por_regiao(posicao: str, regiao: str) -> dict:
+    """Benchmark de uma rota por elo+divisão para UMA região, somando TODOS os campeões
+    daquela rota/região na tabela agregada. { 'ELO_DIV': {amostra, kda, ...}, ... }."""
+    return _consultar_agregados(
+        "UPPER(posicao) = UPPER(?) AND UPPER(regiao) = UPPER(?)",
+        [posicao, regiao],
+    )
 
 def _bench_por_elo(posicao: str, regiao: str = None) -> dict:
     """Retorna { 'ELO_DIV': {metricas} } de uma rota: por região (DB) ou global (cache)."""
@@ -129,38 +141,13 @@ def _bench_por_campeoes(posicao: str, campeoes: list, regiao: str = None) -> dic
     (ponderada por partidas). `regiao` opcional restringe à mesma região."""
     if not campeoes:
         return {}
-    selects = ", ".join(f"AVG({m}) AS {m}" for m in _METRICAS_ROTA)
     placeholders = ", ".join("?" for _ in campeoes)
-    filtro_regiao = " AND UPPER(regiao) = UPPER(?)" if regiao else ""
-    query = f"""
-        SELECT elo, divisao, COUNT(*) AS amostra, {selects}
-        FROM estatisticas_meta
-        WHERE elo IS NOT NULL AND divisao IS NOT NULL
-          AND posicao IS NOT NULL AND posicao <> ''
-          AND UPPER(posicao) = UPPER(?)
-          AND UPPER(campeao) IN ({placeholders}){filtro_regiao}
-        GROUP BY elo, divisao
-        HAVING COUNT(*) >= 20
-    """
+    where = f"UPPER(posicao) = UPPER(?) AND UPPER(campeao) IN ({placeholders})"
     params = [posicao] + [c.upper() for c in campeoes]
     if regiao:
+        where += " AND UPPER(regiao) = UPPER(?)"
         params.append(regiao)
-    conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        linhas = conn.execute(query, params).fetchall()
-    finally:
-        conn.close()
-
-    resultado = {}
-    for linha in linhas:
-        chave = f"{linha['elo']}_{linha['divisao']}".upper()
-        bloco = {"amostra": linha["amostra"]}
-        for m in _METRICAS_ROTA:
-            valor = linha[m]
-            bloco[m] = round(valor, 4) if valor is not None else 0.0
-        resultado[chave] = bloco
-    return resultado
+    return _consultar_agregados(where, params)
 
 @app.get("/benchmarks/campeoes/{posicao}")
 def obter_benchmark_campeoes(

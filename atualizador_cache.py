@@ -6,6 +6,41 @@ import os
 from datetime import datetime
 from collections import Counter
 
+# Métricas numéricas agregadas (mesma união usada pelos endpoints por rota/campeão).
+METRICAS_AGG = [
+    "kda", "cs_min", "ouro_min", "visao_min", "dano_min", "dano_objetivos",
+    "dano_torres", "tempo_cc", "pink_wards", "cura_total", "dano_mitigado",
+    "kpa", "solo_kills", "cs_jungle_10m", "cs_rota_10m", "pct_dano_time",
+]
+
+def atualizar_tabela_agregada(conn):
+    """Materializa estatisticas_agregadas: (campeao, posicao, elo, divisao, regiao) -> n + somas
+    de cada métrica. É a FONTE ÚNICA dos benchmarks por região (rota) e por campeão/pool — os
+    endpoints viram SUM(soma)/SUM(n) sobre esta tabela pequena (~100k linhas), em vez de AVG ao
+    vivo sobre os ~4M de estatisticas_meta (que levava ~1min/request). O rebuild roda dentro de
+    uma transação (BEGIN/COMMIT): com o WAL, a API segue lendo a versão antiga até o COMMIT, sem
+    janela de 'tabela inexistente'. Custo do build (varredura + GROUP BY) é pago aqui, no ciclo
+    do agregador, não por request."""
+    somas = ", ".join(f"SUM({m}) AS soma_{m}" for m in METRICAS_AGG)
+    conn.executescript(f"""
+        BEGIN;
+        DROP TABLE IF EXISTS estatisticas_agregadas;
+        CREATE TABLE estatisticas_agregadas AS
+            SELECT campeao, posicao, elo, divisao, regiao, COUNT(*) AS n, {somas}
+            FROM estatisticas_meta
+            WHERE elo IS NOT NULL AND divisao IS NOT NULL
+              AND posicao IS NOT NULL AND posicao <> ''
+              AND regiao IS NOT NULL AND campeao IS NOT NULL
+            GROUP BY campeao, posicao, elo, divisao, regiao;
+        CREATE INDEX idx_agg_pos_reg
+            ON estatisticas_agregadas(UPPER(posicao), UPPER(regiao), elo, divisao);
+        CREATE INDEX idx_agg_camp_pos_reg
+            ON estatisticas_agregadas(UPPER(campeao), UPPER(posicao), UPPER(regiao), elo, divisao);
+        COMMIT;
+    """)
+    n = conn.execute("SELECT COUNT(*) FROM estatisticas_agregadas").fetchone()[0]
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Tabela de agregados reconstruída ({n} linhas).")
+
 def obter_mapa_de_itens_finais() -> dict:
     """Busca o nome dos itens. Salva em cache local como plano de backup."""
     arquivo_backup = "backup_itens_finais.json"
@@ -193,7 +228,8 @@ def iniciar_agregacao():
             conn.row_factory = sqlite3.Row
             
             mapa_itens_finais = obter_mapa_de_itens_finais()
-            
+
+            atualizar_tabela_agregada(conn)
             atualizar_cache_benchmarks(conn)
             atualizar_cache_benchmarks_rota(conn)
             atualizar_cache_panorama(conn, mapa_itens_finais)
