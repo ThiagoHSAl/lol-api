@@ -36,7 +36,7 @@ PARTIDAS_POR_SUBELO = 50
 def configurar_banco():
     db_name = 'meu_meta_dataset_global.db'
     # Adicionamos um timeout de 20 segundos (ensina o crawler a esperar na fila)
-    conn = sqlite3.connect("meu_meta_dataset_global.db", timeout=20.0)
+    conn = sqlite3.connect("meu_meta_dataset_global.db", timeout=120.0)
 
     # Ativa o modo WAL (Permite que a API leia enquanto o Crawler escreve!)
     conn.execute('PRAGMA journal_mode=WAL;')

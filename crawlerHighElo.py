@@ -40,7 +40,7 @@ META_PARTIDAS_POR_ELO = 200
 # 3. CONEXÃO COM O BANCO DE DADOS GLOBAL
 # ==========================================
 def configurar_banco():
-    conn = sqlite3.connect("meu_meta_dataset_global.db", timeout=20.0)
+    conn = sqlite3.connect("meu_meta_dataset_global.db", timeout=120.0)
     # Fundamental: WAL mode ativado para permitir gravação simultânea com outros scripts
     conn.execute('PRAGMA journal_mode=WAL;')
     

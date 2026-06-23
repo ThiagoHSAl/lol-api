@@ -3,8 +3,12 @@ import json
 import time
 import requests
 import os
+import threading
 from datetime import datetime
 from collections import Counter
+
+DB = "meu_meta_dataset_global.db"
+INTERVALO = 3600  # cadência-alvo de cada tarefa (medida a partir do INÍCIO de cada ciclo)
 
 # Métricas numéricas agregadas (mesma união usada pelos endpoints por rota/campeão).
 METRICAS_AGG = [
@@ -13,66 +17,121 @@ METRICAS_AGG = [
     "kpa", "solo_kills", "cs_jungle_10m", "cs_rota_10m", "pct_dano_time",
 ]
 
-def atualizar_tabela_agregada(conn):
-    """Materializa estatisticas_agregadas: (campeao, posicao, elo, divisao, regiao) -> n + somas
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def conectar(somente_leitura=False):
+    """Cada tarefa abre a SUA conexão. Em WAL, N leitores rodam em paralelo + 1 escritor;
+    as tarefas de cache (benchmarks/rota/panorama) são somente-leitura e nunca tomam lock,
+    então jamais seguram os crawlers nem umas às outras."""
+    if somente_leitura:
+        conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=30.0)
+    else:
+        conn = sqlite3.connect(DB, timeout=60.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=60000")
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# 1) TABELA AGREGADA — a ÚNICA tarefa que escreve no banco.
+# ---------------------------------------------------------------------------
+def atualizar_tabela_agregada():
+    """Materializa estatisticas_agregadas: (campeao,posicao,elo,divisao,regiao) -> n + somas
     de cada métrica. É a FONTE ÚNICA dos benchmarks por região (rota) e por campeão/pool — os
-    endpoints viram SUM(soma)/SUM(n) sobre esta tabela pequena (~100k linhas), em vez de AVG ao
-    vivo sobre os ~4M de estatisticas_meta (que levava ~1min/request). O rebuild roda dentro de
-    uma transação (BEGIN/COMMIT): com o WAL, a API segue lendo a versão antiga até o COMMIT, sem
-    janela de 'tabela inexistente'. Custo do build (varredura + GROUP BY) é pago aqui, no ciclo
-    do agregador, não por request."""
+    endpoints viram SUM(soma)/SUM(n) sobre esta tabela pequena (~70k linhas), em vez de AVG ao
+    vivo sobre os ~4M de estatisticas_meta.
+
+    ANTES: 'CREATE TABLE AS SELECT' (varredura+GROUP BY de 4M linhas, ~12min) rodava DENTRO de
+    uma transação de escrita, segurando o write-lock o tempo todo → travava os crawlers por
+    ~12min. AGORA, separamos em duas fases:
+      • FASE LEITURA (cara): roda o GROUP BY como SELECT puro numa conexão somente-leitura.
+        Em WAL, leitura NÃO toma write-lock → os crawlers escrevem livremente durante os ~12min.
+      • FASE SWAP (rápida): uma transação curta (segundos) faz DROP+CREATE+executemany das ~70k
+        linhas já calculadas + índices. O write-lock fica retido só por segundos.
+    Os leitores (API) seguem vendo a tabela ANTIGA até o COMMIT, sem janela de 'tabela inexistente'."""
     somas = ", ".join(f"SUM({m}) AS soma_{m}" for m in METRICAS_AGG)
-    conn.executescript(f"""
-        BEGIN;
-        DROP TABLE IF EXISTS estatisticas_agregadas;
-        CREATE TABLE estatisticas_agregadas AS
-            SELECT campeao, posicao, elo, divisao, regiao, COUNT(*) AS n, {somas}
-            FROM estatisticas_meta
-            WHERE elo IS NOT NULL AND divisao IS NOT NULL
-              AND posicao IS NOT NULL AND posicao <> ''
-              AND regiao IS NOT NULL AND campeao IS NOT NULL
-            GROUP BY campeao, posicao, elo, divisao, regiao;
-        CREATE INDEX idx_agg_pos_reg
-            ON estatisticas_agregadas(UPPER(posicao), UPPER(regiao), elo, divisao);
-        CREATE INDEX idx_agg_camp_pos_reg
-            ON estatisticas_agregadas(UPPER(campeao), UPPER(posicao), UPPER(regiao), elo, divisao);
-        COMMIT;
-    """)
-    n = conn.execute("SELECT COUNT(*) FROM estatisticas_agregadas").fetchone()[0]
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Tabela de agregados reconstruída ({n} linhas).")
+    select_agg = f"""
+        SELECT campeao, posicao, elo, divisao, regiao, COUNT(*) AS n, {somas}
+        FROM estatisticas_meta
+        WHERE elo IS NOT NULL AND divisao IS NOT NULL
+          AND posicao IS NOT NULL AND posicao <> ''
+          AND regiao IS NOT NULL AND campeao IS NOT NULL
+        GROUP BY campeao, posicao, elo, divisao, regiao
+    """
+
+    # FASE LEITURA — pesada, mas sem write-lock (não trava crawlers).
+    ro = conectar(somente_leitura=True)
+    try:
+        linhas = ro.execute(select_agg).fetchall()
+    finally:
+        ro.close()
+
+    cols = ["campeao", "posicao", "elo", "divisao", "regiao", "n"] + [f"soma_{m}" for m in METRICAS_AGG]
+    coldefs = ("campeao TEXT, posicao TEXT, elo TEXT, divisao TEXT, regiao TEXT, n INTEGER, "
+               + ", ".join(f"soma_{m} REAL" for m in METRICAS_AGG))
+    placeholders = ", ".join("?" * len(cols))
+    dados = [tuple(linha) for linha in linhas]
+
+    # FASE SWAP — curta: write-lock retido só por segundos.
+    rw = conectar()
+    try:
+        rw.execute("BEGIN IMMEDIATE")
+        rw.execute("DROP TABLE IF EXISTS estatisticas_agregadas")
+        rw.execute(f"CREATE TABLE estatisticas_agregadas ({coldefs})")
+        rw.executemany(
+            f"INSERT INTO estatisticas_agregadas ({', '.join(cols)}) VALUES ({placeholders})",
+            dados,
+        )
+        rw.execute("""CREATE INDEX idx_agg_pos_reg
+                      ON estatisticas_agregadas(UPPER(posicao), UPPER(regiao), elo, divisao)""")
+        rw.execute("""CREATE INDEX idx_agg_camp_pos_reg
+                      ON estatisticas_agregadas(UPPER(campeao), UPPER(posicao), UPPER(regiao), elo, divisao)""")
+        rw.execute("COMMIT")
+        # Mantém o WAL pequeno: trunca o que for possível (não bloqueia se houver leitor ativo).
+        rw.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        rw.execute("ROLLBACK")
+        raise
+    finally:
+        rw.close()
+    log(f"✅ Tabela de agregados reconstruída ({len(dados)} linhas).")
+
 
 def obter_mapa_de_itens_finais() -> dict:
     """Busca o nome dos itens. Salva em cache local como plano de backup."""
     arquivo_backup = "backup_itens_finais.json"
-    
+
     try:
         url_versoes = "https://ddragon.leagueoflegends.com/api/versions.json"
         patch_atual = requests.get(url_versoes, timeout=5).json()[0]
         url_itens = f"https://ddragon.leagueoflegends.com/cdn/{patch_atual}/data/pt_BR/item.json"
         dados_itens = requests.get(url_itens, timeout=10).json()["data"]
-        
+
         mapa_itens_finais = {}
         for item_id, detalhes in dados_itens.items():
             if "into" in detalhes: continue
-            
+
             tags = detalhes.get("tags", [])
             if "Consumable" in tags or "Trinket" in tags or "Vision" in tags: continue
-                
+
             custo_total = detalhes.get("gold", {}).get("total", 0)
             is_bota = "Boots" in tags
-            
+
             if custo_total >= 1500 or (is_bota and custo_total > 500):
                 mapa_itens_finais[item_id] = detalhes["name"]
-        
+
         # SUCESSO! Salva o resultado no disco como um backup de segurança
         with open(arquivo_backup, "w") as f:
             json.dump(mapa_itens_finais, f)
-            
+
         return mapa_itens_finais
-        
+
     except Exception as e:
         print(f"⚠️ Servidor da Riot falhou ({e}). Tentando usar o cache local...")
-        
+
         # PLANO B: Se a internet cair ou a Riot travar, usamos o último cache salvo
         if os.path.exists(arquivo_backup):
             with open(arquivo_backup, "r") as f:
@@ -81,18 +140,24 @@ def obter_mapa_de_itens_finais() -> dict:
             print("❌ Nenhum cache local encontrado.")
             return {}
 
-def atualizar_cache_benchmarks(conn):
-    """Sua função original de agregação de métricas."""
-    cursor = conn.cursor()
-    query = """
-        SELECT elo || '_' || divisao AS elo_completo,
-               AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min, AVG(visao_min) AS visao_min
-        FROM estatisticas_meta
-        WHERE elo IS NOT NULL AND divisao IS NOT NULL
-        GROUP BY elo, divisao
-    """
-    cursor.execute(query)
-    linhas = cursor.fetchall()
+
+# ---------------------------------------------------------------------------
+# 2) BENCHMARKS BASE (somente leitura)
+# ---------------------------------------------------------------------------
+def atualizar_cache_benchmarks():
+    """Agregação de métricas base por elo+divisão."""
+    conn = conectar(somente_leitura=True)
+    try:
+        query = """
+            SELECT elo || '_' || divisao AS elo_completo,
+                   AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min, AVG(visao_min) AS visao_min
+            FROM estatisticas_meta
+            WHERE elo IS NOT NULL AND divisao IS NOT NULL
+            GROUP BY elo, divisao
+        """
+        linhas = conn.execute(query).fetchall()
+    finally:
+        conn.close()
 
     resultado_json = {}
     for linha in linhas:
@@ -101,40 +166,41 @@ def atualizar_cache_benchmarks(conn):
             "kda": round(linha["kda"], 2) if linha["kda"] else 0.0,
             "cs_min": round(linha["cs_min"], 2) if linha["cs_min"] else 0.0,
             "ouro_min": round(linha["ouro_min"], 2) if linha["ouro_min"] else 0.0,
-            "visao_min": round(linha["visao_min"], 2) if linha["visao_min"] else 0.0
+            "visao_min": round(linha["visao_min"], 2) if linha["visao_min"] else 0.0,
         }
 
     with open("cache_benchmarks.json", "w") as f:
         json.dump(resultado_json, f, indent=4)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Cache de Benchmarks Base atualizado!")
+    log("✅ Cache de Benchmarks Base atualizado!")
 
-def atualizar_cache_benchmarks_rota(conn):
-    """
-    Agrega os benchmarks por elo + divisao + POSICAO, com todas as metricas
-    relevantes a cada rota. Permite avaliar o jogador (e os elos) de forma
-    personalizada por funcao no mapa.
-    """
-    cursor = conn.cursor()
-    query = """
-        SELECT elo, divisao, posicao, COUNT(*) AS amostra,
-               AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min,
-               AVG(visao_min) AS visao_min, AVG(dano_min) AS dano_min,
-               AVG(dano_objetivos) AS dano_objetivos, AVG(dano_torres) AS dano_torres,
-               AVG(tempo_cc) AS tempo_cc, AVG(pink_wards) AS pink_wards,
-               AVG(cura_total) AS cura_total, AVG(dano_mitigado) AS dano_mitigado,
-               AVG(kpa) AS kpa, AVG(solo_kills) AS solo_kills,
-               AVG(cs_jungle_10m) AS cs_jungle_10m, AVG(cs_rota_10m) AS cs_rota_10m,
-               AVG(pct_dano_time) AS pct_dano_time
-        FROM estatisticas_meta
-        WHERE elo IS NOT NULL AND divisao IS NOT NULL
-          AND posicao IS NOT NULL AND posicao <> ''
-        GROUP BY elo, divisao, posicao
-        HAVING COUNT(*) >= 20
-    """
-    cursor.execute(query)
-    linhas = cursor.fetchall()
 
-    # Colunas numericas a expor (mesma uniao usada pelo frontend por rota)
+# ---------------------------------------------------------------------------
+# 3) BENCHMARKS POR ROTA (somente leitura)
+# ---------------------------------------------------------------------------
+def atualizar_cache_benchmarks_rota():
+    """Agrega benchmarks por elo + divisao + POSICAO, com todas as métricas relevantes a cada rota."""
+    conn = conectar(somente_leitura=True)
+    try:
+        query = """
+            SELECT elo, divisao, posicao, COUNT(*) AS amostra,
+                   AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min,
+                   AVG(visao_min) AS visao_min, AVG(dano_min) AS dano_min,
+                   AVG(dano_objetivos) AS dano_objetivos, AVG(dano_torres) AS dano_torres,
+                   AVG(tempo_cc) AS tempo_cc, AVG(pink_wards) AS pink_wards,
+                   AVG(cura_total) AS cura_total, AVG(dano_mitigado) AS dano_mitigado,
+                   AVG(kpa) AS kpa, AVG(solo_kills) AS solo_kills,
+                   AVG(cs_jungle_10m) AS cs_jungle_10m, AVG(cs_rota_10m) AS cs_rota_10m,
+                   AVG(pct_dano_time) AS pct_dano_time
+            FROM estatisticas_meta
+            WHERE elo IS NOT NULL AND divisao IS NOT NULL
+              AND posicao IS NOT NULL AND posicao <> ''
+            GROUP BY elo, divisao, posicao
+            HAVING COUNT(*) >= 20
+        """
+        linhas = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+
     metricas = [
         "kda", "cs_min", "ouro_min", "visao_min", "dano_min", "dano_objetivos",
         "dano_torres", "tempo_cc", "pink_wards", "cura_total", "dano_mitigado",
@@ -155,90 +221,129 @@ def atualizar_cache_benchmarks_rota(conn):
 
     with open("cache_benchmarks_rota.json", "w") as f:
         json.dump(resultado_json, f, indent=4)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Cache de Benchmarks por Rota atualizado!")
+    log("✅ Cache de Benchmarks por Rota atualizado!")
 
-def atualizar_cache_panorama(conn, mapa_itens_finais):
-    """Processa os Top 10 Campeões e a Build ideal apenas com itens completos."""
-    cursor = conn.cursor()
+
+# ---------------------------------------------------------------------------
+# 4) PANORAMA META (somente leitura) — otimizado
+# ---------------------------------------------------------------------------
+def atualizar_cache_panorama():
+    """Top 10 campeões + build ideal (itens completos) por elo/rota.
+
+    ANTES: para CADA campeão do top-10 disparava um 'SELECT itens WHERE campeao=?' que, via
+    idx_campeao, lia TODAS as linhas do campeão (todos elos/regiões) e filtrava depois — ~500
+    varreduras enormes por ciclo, levando horas. AGORA, apoiado no índice composto
+    (elo,posicao,campeao) e sem UPPER() (os dados já estão em maiúsculas):
+      • o top-10 vira um range scan indexado da partição (elo,posicao);
+      • os itens são lidos em LOTE, uma query por combo com 'campeao IN (top10)', tocando só
+        as linhas daquele elo/rota dos 10 campeões — em vez de 1 varredura por campeão."""
+    mapa_itens_finais = obter_mapa_de_itens_finais()
     elos = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"]
     posicoes = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
-    
-    panorama_global = {}
 
-    for elo in elos:
-        panorama_elo = {}
-        for posicao in posicoes:
-            query_campeoes = """
-                SELECT campeao, COUNT(*) as total_partidas, SUM(vitoria) * 100.0 / COUNT(*) as winrate
-                FROM estatisticas_meta
-                WHERE UPPER(elo) = ? AND UPPER(posicao) = ?
-                GROUP BY campeao
-                HAVING total_partidas > 50
-                ORDER BY winrate DESC
-                LIMIT 10
-            """
-            cursor.execute(query_campeoes, (elo, posicao))
-            campeoes_db = cursor.fetchall()
-            
-            top_10 = []
-            for champ_row in campeoes_db:
-                campeao, amostra, winrate = champ_row["campeao"], champ_row["total_partidas"], champ_row["winrate"]
-                
-                query_itens = "SELECT itens FROM estatisticas_meta WHERE UPPER(elo) = ? AND UPPER(posicao) = ? AND campeao = ?"
-                cursor.execute(query_itens, (elo, posicao, campeao))
-                linhas_itens = cursor.fetchall()
-                
-                contador = Counter()
-                for linha in linhas_itens:
-                    itens_str = linha["itens"]
-                    if not itens_str: continue
-                    
-                    lista_ids = json.loads(itens_str) if "[" in itens_str else itens_str.split(',')
-                    
-                    for item_id in lista_ids:
-                        item_id = str(item_id).strip()
-                        
-                        # A MÁGICA ACONTECE AQUI:
-                        # Só adicionamos na contagem se ele for um Item Final validado!
-                        if item_id in mapa_itens_finais:
-                            contador[item_id] += 1
-                
-                top_5_ids = [item_id for item_id, freq in contador.most_common(5)]
-                top_5_nomes = [mapa_itens_finais[i] for i in top_5_ids]
+    conn = conectar(somente_leitura=True)
+    try:
+        panorama_global = {}
+        for elo in elos:
+            panorama_elo = {}
+            for posicao in posicoes:
+                campeoes_db = conn.execute(
+                    """
+                    SELECT campeao, COUNT(*) AS total_partidas,
+                           SUM(vitoria) * 100.0 / COUNT(*) AS winrate
+                    FROM estatisticas_meta
+                    WHERE elo = ? AND posicao = ?
+                    GROUP BY campeao
+                    HAVING total_partidas > 50
+                    ORDER BY winrate DESC
+                    LIMIT 10
+                    """,
+                    (elo, posicao),
+                ).fetchall()
 
-                top_10.append({
-                    "campeao": campeao,
-                    "winrate": round(winrate, 2),
-                    "amostra": amostra,
-                    "top_5_itens": top_5_nomes
-                })
-            
-            panorama_elo[posicao] = top_10
-        panorama_global[elo] = panorama_elo
+                top_campeoes = [r["campeao"] for r in campeoes_db]
+                contadores = {c: Counter() for c in top_campeoes}
+
+                if top_campeoes:
+                    placeholders = ", ".join("?" * len(top_campeoes))
+                    cursor_itens = conn.execute(
+                        f"""
+                        SELECT campeao, itens FROM estatisticas_meta
+                        WHERE elo = ? AND posicao = ? AND campeao IN ({placeholders})
+                        """,
+                        (elo, posicao, *top_campeoes),
+                    )
+                    for linha in cursor_itens:
+                        itens_str = linha["itens"]
+                        if not itens_str:
+                            continue
+                        lista_ids = json.loads(itens_str) if "[" in itens_str else itens_str.split(",")
+                        contador = contadores[linha["campeao"]]
+                        for item_id in lista_ids:
+                            item_id = str(item_id).strip()
+                            if item_id in mapa_itens_finais:
+                                contador[item_id] += 1
+
+                top_10 = []
+                for champ_row in campeoes_db:
+                    campeao = champ_row["campeao"]
+                    top_5_ids = [item_id for item_id, _ in contadores[campeao].most_common(5)]
+                    top_5_nomes = [mapa_itens_finais[i] for i in top_5_ids]
+                    top_10.append({
+                        "campeao": campeao,
+                        "winrate": round(champ_row["winrate"], 2),
+                        "amostra": champ_row["total_partidas"],
+                        "top_5_itens": top_5_nomes,
+                    })
+
+                panorama_elo[posicao] = top_10
+            panorama_global[elo] = panorama_elo
+    finally:
+        conn.close()
 
     with open("cache_panorama.json", "w") as f:
         json.dump(panorama_global, f, indent=4)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Cache do Panorama Meta atualizado!")
+    log("✅ Cache do Panorama Meta atualizado!")
+
+
+# ---------------------------------------------------------------------------
+# Orquestração: cada tarefa em SEU loop/thread, com cadência própria.
+# Uma tarefa lenta só atrasa a si mesma — nunca segura as outras.
+# ---------------------------------------------------------------------------
+def loop_tarefa(nome, funcao):
+    while True:
+        inicio = time.time()
+        try:
+            funcao()
+        except Exception as e:
+            log(f"❌ Erro na tarefa '{nome}': {e}")
+        dormir = max(0, INTERVALO - (time.time() - inicio))
+        time.sleep(dormir)
+
 
 def iniciar_agregacao():
-    while True:
-        try:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Iniciando processamento de caches...")
-            conn = sqlite3.connect("meu_meta_dataset_global.db", timeout=20.0)
-            conn.row_factory = sqlite3.Row
-            
-            mapa_itens_finais = obter_mapa_de_itens_finais()
+    # Garante o índice que sustenta o panorama (idempotente; instantâneo se já existir).
+    try:
+        c = conectar()
+        c.execute("PRAGMA busy_timeout=120000")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_elo_pos_camp ON estatisticas_meta(elo, posicao, campeao)")
+        c.close()
+    except Exception as e:
+        log(f"⚠️ Não foi possível garantir idx_elo_pos_camp: {e}")
 
-            atualizar_tabela_agregada(conn)
-            atualizar_cache_benchmarks(conn)
-            atualizar_cache_benchmarks_rota(conn)
-            atualizar_cache_panorama(conn, mapa_itens_finais)
-            
-            conn.close()
-        except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Erro crítico no worker: {e}")
-            
-        time.sleep(3600)
+    tarefas = [
+        ("agregados", atualizar_tabela_agregada),
+        ("benchmarks", atualizar_cache_benchmarks),
+        ("benchmarks_rota", atualizar_cache_benchmarks_rota),
+        ("panorama", atualizar_cache_panorama),
+    ]
+    log("Iniciando processamento de caches em PARALELO (4 tarefas independentes)...")
+    threads = [threading.Thread(target=loop_tarefa, args=(n, f), daemon=True, name=n) for n, f in tarefas]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
 
 if __name__ == "__main__":
     iniciar_agregacao()
