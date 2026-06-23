@@ -122,6 +122,84 @@ def _bench_por_elo(posicao: str, regiao: str = None) -> dict:
     dados = ler_cache_rota()
     return {chave: bloco[posicao] for chave, bloco in dados.items() if posicao in bloco}
 
+def _bench_por_campeoes(posicao: str, campeoes: list, regiao: str = None) -> dict:
+    """Agrega o benchmark de uma rota restrito a uma LISTA de campeões (mono = 1 nome,
+    pool = vários), por elo+divisão, direto do DB. Mesma forma do benchmark de rota:
+    { 'ELO_DIV': {amostra, kda, ...}, ... }. O AVG sobre a lista já dá a 'média da pool'
+    (ponderada por partidas). `regiao` opcional restringe à mesma região."""
+    if not campeoes:
+        return {}
+    selects = ", ".join(f"AVG({m}) AS {m}" for m in _METRICAS_ROTA)
+    placeholders = ", ".join("?" for _ in campeoes)
+    filtro_regiao = " AND UPPER(regiao) = UPPER(?)" if regiao else ""
+    query = f"""
+        SELECT elo, divisao, COUNT(*) AS amostra, {selects}
+        FROM estatisticas_meta
+        WHERE elo IS NOT NULL AND divisao IS NOT NULL
+          AND posicao IS NOT NULL AND posicao <> ''
+          AND UPPER(posicao) = UPPER(?)
+          AND UPPER(campeao) IN ({placeholders}){filtro_regiao}
+        GROUP BY elo, divisao
+        HAVING COUNT(*) >= 20
+    """
+    params = [posicao] + [c.upper() for c in campeoes]
+    if regiao:
+        params.append(regiao)
+    conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        linhas = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+    resultado = {}
+    for linha in linhas:
+        chave = f"{linha['elo']}_{linha['divisao']}".upper()
+        bloco = {"amostra": linha["amostra"]}
+        for m in _METRICAS_ROTA:
+            valor = linha[m]
+            bloco[m] = round(valor, 4) if valor is not None else 0.0
+        resultado[chave] = bloco
+    return resultado
+
+@app.get("/benchmarks/campeoes/{posicao}")
+def obter_benchmark_campeoes(
+    posicao: str,
+    campeoes: str = Query(..., description="Lista de campeões separada por vírgula (mono = 1)"),
+    elo: Optional[str] = None,
+    regiao: Optional[str] = None,
+):
+    """Benchmark de uma rota restrito a um conjunto de campeões (mono ou pool do jogador).
+    `?campeoes=Jinx,Caitlyn,Ashe`. Sem `?elo=`, retorna todos os elos (ordenados);
+    com `?elo=`, faz média das divisões daquele elo (apex ignora divisão)."""
+    posicao = _validar_posicao(posicao)
+    lista = [c.strip() for c in campeoes.split(",") if c.strip()]
+    if not lista:
+        raise HTTPException(status_code=400, detail="Informe ao menos um campeão.")
+
+    bench = _bench_por_campeoes(posicao, lista, regiao)
+    if not bench:
+        raise HTTPException(status_code=404, detail="Amostra insuficiente para esses campeões.")
+
+    if not elo:
+        return {chave: bench[chave] for chave in ORDEM_ELOS if chave in bench}
+
+    elo = elo.upper()
+    if elo in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
+        bloco = bench.get(f"{elo}_I")
+        if bloco:
+            return {"elo": elo, "posicao": posicao, "campeoes": lista, "benchmark": bloco}
+        raise HTTPException(status_code=404, detail="Benchmark não encontrado.")
+
+    blocos = [bench[f"{elo}_{d}"] for d in ["I", "II", "III", "IV"] if f"{elo}_{d}" in bench]
+    if not blocos:
+        raise HTTPException(status_code=404, detail="Benchmark não encontrado.")
+    media = {}
+    for metrica in blocos[0].keys():
+        valores = [b[metrica] for b in blocos if metrica in b]
+        media[metrica] = round(sum(valores) / len(valores), 4)
+    return {"elo": elo, "posicao": posicao, "campeoes": lista, "benchmark": media}
+
 @app.get("/benchmarks/rota/{posicao}")
 def obter_benchmark_rota_todos(posicao: str, regiao: Optional[str] = None):
     """

@@ -67,6 +67,12 @@ def configurar_banco():
             cs_jungle_10m REAL, cs_rota_10m REAL, pct_dano_time REAL
         )
     ''')
+    # Índice para as consultas por campeão (benchmark por-campeão/pool). Sem ele, o
+    # AVG filtrado por campeao varre a tabela inteira (~17s); com ele cai p/ ~ms.
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_campeao_pos
+        ON estatisticas_meta(campeao, posicao, elo, divisao, regiao)
+    ''')
     conn.commit()
     return conn
 
