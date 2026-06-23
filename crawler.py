@@ -72,8 +72,10 @@ def configurar_banco():
     # UPPER(...) (case-insensitive) — um índice nas colunas cruas NÃO é usado e o AVG
     # cai em varredura de tabela inteira (~19s). Inclui elo, divisao p/ o GROUP BY usar
     # a ordem do índice (sem b-tree temporário).
+    # Nome próprio (idx_camp_pos_upper) para não colidir com um eventual idx_campeao_upper
+    # single-column pré-existente — IF NOT EXISTS sobre nome ocupado seria no-op silencioso.
     cursor.execute('''
-        CREATE INDEX IF NOT EXISTS idx_campeao_upper
+        CREATE INDEX IF NOT EXISTS idx_camp_pos_upper
         ON estatisticas_meta(UPPER(campeao), UPPER(posicao), elo, divisao)
     ''')
     conn.commit()
