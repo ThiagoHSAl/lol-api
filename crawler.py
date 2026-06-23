@@ -67,11 +67,14 @@ def configurar_banco():
             cs_jungle_10m REAL, cs_rota_10m REAL, pct_dano_time REAL
         )
     ''')
-    # Índice para as consultas por campeão (benchmark por-campeão/pool). Sem ele, o
-    # AVG filtrado por campeao varre a tabela inteira (~17s); com ele cai p/ ~ms.
+    # Índice para as consultas por campeão (benchmark por-campeão/pool). PRECISA ser um
+    # índice de EXPRESSÃO sobre UPPER(campeao)/UPPER(posicao) porque a query filtra com
+    # UPPER(...) (case-insensitive) — um índice nas colunas cruas NÃO é usado e o AVG
+    # cai em varredura de tabela inteira (~19s). Inclui elo, divisao p/ o GROUP BY usar
+    # a ordem do índice (sem b-tree temporário).
     cursor.execute('''
-        CREATE INDEX IF NOT EXISTS idx_campeao_pos
-        ON estatisticas_meta(campeao, posicao, elo, divisao, regiao)
+        CREATE INDEX IF NOT EXISTS idx_campeao_upper
+        ON estatisticas_meta(UPPER(campeao), UPPER(posicao), elo, divisao)
     ''')
     conn.commit()
     return conn
