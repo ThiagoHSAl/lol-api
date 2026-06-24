@@ -4,6 +4,7 @@ import requests
 import sqlite3
 import random
 from dotenv import load_dotenv
+from ingest_crawler import garantir_colunas, inserir_partida  # rota inferida + sinais crus
 
 # ==========================================
 # 1. CARREGAMENTO INICIAL DA CHAVE
@@ -50,7 +51,7 @@ def configurar_banco():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS estatisticas_meta (
             id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT, regiao TEXT, elo TEXT, divisao TEXT,
-            campeao TEXT, posicao TEXT, vitoria INTEGER, 
+            campeao TEXT, posicao TEXT, vitoria INTEGER,
             kda REAL, cs_min REAL, ouro_min REAL, visao_min REAL, dano_min REAL, itens TEXT,
             dano_objetivos REAL, dano_torres REAL, tempo_cc REAL, pink_wards INTEGER,
             cura_total REAL, dano_mitigado REAL, tempo_vivo REAL, first_blood INTEGER, fb_assist INTEGER,
@@ -58,6 +59,7 @@ def configurar_banco():
             kpa REAL, skillshots_desviadas INTEGER, solo_kills INTEGER, cs_jungle_10m REAL, cs_rota_10m REAL, pct_dano_time REAL
         )
     ''')
+    garantir_colunas(conn)  # colunas de sinais crus (puuid, individual_position, ...)
     conn.commit()
     return conn
 
@@ -143,37 +145,12 @@ def iniciar_crawler_apex():
                             if cursor.execute("SELECT 1 FROM partidas_processadas WHERE match_id = ?", (m_id,)).fetchone(): continue
                             
                             data = chamada_api(f"https://{macro_regiao}.api.riotgames.com/lol/match/v5/matches/{m_id}")
-                            if not data or data['info'].get('gameDuration', 0) < 300: continue 
-                            
-                            duracao_min = data['info']['gameDuration'] / 60.0
-                            
-                            for p in data['info']['participants']:
-                                
-                                kda = (p['kills'] + p['assists']) / max(1, p['deaths'])
-                                cs = p.get('totalMinionsKilled', 0) + p.get('neutralMinionsKilled', 0)
-                                dano = p.get('totalDamageDealtToChampions', 0)
-                                itens_str = ",".join([str(p.get(f'item{i}', 0)) for i in range(7)])
-                                chal = p.get('challenges', {})
-                                
-                                # Divisão padrão "I" para manter a sanidade do banco de dados
-                                cursor.execute('''
-                                    INSERT INTO estatisticas_meta (
-                                        match_id, regiao, elo, divisao, campeao, posicao, vitoria, 
-                                        kda, cs_min, ouro_min, visao_min, dano_min, itens,
-                                        dano_objetivos, dano_torres, tempo_cc, pink_wards,
-                                        cura_total, dano_mitigado, tempo_vivo, first_blood, fb_assist,
-                                        pings_perigo, pings_ajuda, pings_mia,
-                                        kpa, skillshots_desviadas, solo_kills, cs_jungle_10m, cs_rota_10m, pct_dano_time
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                ''', (
-                                    m_id, servidor, elo, "I", p.get('championName'), p.get('teamPosition'), 1 if p.get('win') else 0,
-                                    kda, cs / duracao_min, p.get('goldEarned', 0) / duracao_min, p.get('visionScore', 0) / duracao_min, dano / duracao_min, itens_str,
-                                    p.get('damageDealtToObjectives', 0), p.get('damageDealtToBuildings', 0), p.get('timeCCingOthers', 0), p.get('visionWardsBoughtInGame', 0),
-                                    p.get('totalHeal', 0), p.get('damageSelfMitigated', 0), p.get('longestTimeSpentLiving', 0), 1 if p.get('firstBloodKill') else 0, 1 if p.get('firstBloodAssist') else 0,
-                                    # AQUI A CORREÇÃO: SOMA DOS PINGS DE PERIGO REAIS
-                                    (p.get('getBackPings', 0) + p.get('dangerPings', 0)), p.get('assistMePings', 0), p.get('enemyMissingPings', 0),
-                                    chal.get('killParticipation', 0), chal.get('skillshotsDodged', 0), chal.get('soloKills', 0), chal.get('jungleCsBefore10Minutes', 0), chal.get('laneMinionsFirst10Minutes', 0), chal.get('teamDamagePercentage', 0)
-                                ))                            
+                            if not data or data['info'].get('gameDuration', 0) < 300: continue
+
+                            # Rota inferida (não o teamPosition cru) + sinais crus persistidos;
+                            # divisão padrão "I" para manter a sanidade do banco de dados.
+                            inserir_partida(cursor, data, m_id, servidor, elo, "I")
+
                             cursor.execute("INSERT INTO partidas_processadas VALUES (?)", (m_id,))
                             conn.commit()
                             partidas_coletadas += 1

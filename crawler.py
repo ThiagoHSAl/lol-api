@@ -4,6 +4,7 @@ import requests
 import sqlite3
 import random
 from dotenv import load_dotenv
+from ingest_crawler import garantir_colunas, inserir_partida  # rota inferida + sinais crus
 
 # ==========================================
 # 1. CARREGAMENTO INICIAL DA CHAVE
@@ -78,6 +79,7 @@ def configurar_banco():
         CREATE INDEX IF NOT EXISTS idx_camp_pos_upper
         ON estatisticas_meta(UPPER(campeao), UPPER(posicao), elo, divisao)
     ''')
+    garantir_colunas(conn)  # colunas de sinais crus (puuid, individual_position, ...)
     conn.commit()
     return conn
 
@@ -161,45 +163,13 @@ def iniciar_crawler():
                                 if cursor.execute("SELECT 1 FROM partidas_processadas WHERE match_id = ?", (m_id,)).fetchone(): continue
                                 
                                 data = chamada_api(f"https://{macro_regiao}.api.riotgames.com/lol/match/v5/matches/{m_id}")
-                                if not data or data['info'].get('gameDuration', 0) < 300: continue 
-                                
-                                duracao_min = data['info']['gameDuration'] / 60.0
-                                
-                                for p in data['info']['participants']:
-                                    
-                                    # 1. Métricas Base
-                                    kda = (p['kills'] + p['assists']) / max(1, p['deaths'])
-                                    cs = p.get('totalMinionsKilled', 0) + p.get('neutralMinionsKilled', 0)
-                                    dano = p.get('totalDamageDealtToChampions', 0)
-                                    
-                                    itens_lista = [str(p.get(f'item{i}', 0)) for i in range(7)]
-                                    itens_str = ",".join(itens_lista)
+                                if not data or data['info'].get('gameDuration', 0) < 300: continue
 
-                                    # 2. Dicionário de Challenges (Onde mora o ouro)
-                                    chal = p.get('challenges', {})
-                                    
-                                    # 3. Extração Segura de Dados (.get impede o script de quebrar se a Riot esquecer uma chave)
-                                    cursor.execute('''
-                                        INSERT INTO estatisticas_meta (
-                                            match_id, regiao, elo, divisao, campeao, posicao, vitoria, 
-                                            kda, cs_min, ouro_min, visao_min, dano_min, itens,
-                                            dano_objetivos, dano_torres, tempo_cc, pink_wards,
-                                            cura_total, dano_mitigado, tempo_vivo, first_blood, fb_assist,
-                                            pings_perigo, pings_ajuda, pings_mia,
-                                            kpa, skillshots_desviadas, solo_kills, cs_jungle_10m, cs_rota_10m, pct_dano_time
-                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    ''', (
-                                        m_id, servidor, elo, div, p.get('championName'), p.get('teamPosition'), 1 if p.get('win') else 0,
-                                        # Base
-                                        kda, cs / duracao_min, p.get('goldEarned', 0) / duracao_min, p.get('visionScore', 0) / duracao_min, dano / duracao_min, itens_str,
-                                        # Macro
-                                        p.get('damageDealtToObjectives', 0), p.get('damageDealtToBuildings', 0), p.get('timeCCingOthers', 0), p.get('visionWardsBoughtInGame', 0),
-                                        # Micro
-                                        p.get('totalHeal', 0), p.get('damageSelfMitigated', 0), p.get('longestTimeSpentLiving', 0), 1 if p.get('firstBloodKill') else 0, 1 if p.get('firstBloodAssist') else 0,
-                                        # Pings (Somando o Amarelo de Recuar com o Vermelho de Perigo)
-                                        (p.get('getBackPings', 0) + p.get('dangerPings', 0)), p.get('assistMePings', 0), p.get('enemyMissingPings', 0),                                        chal.get('killParticipation', 0), chal.get('skillshotsDodged', 0), chal.get('soloKills', 0), chal.get('jungleCsBefore10Minutes', 0), chal.get('laneMinionsFirst10Minutes', 0), chal.get('teamDamagePercentage', 0)
-                                    ))
-                                
+                                # Cruza os sinais da match-v5, grava a ROTA inferida (não o
+                                # teamPosition cru), pula participantes com rota indeduzível e
+                                # persiste os sinais crus p/ re-derivação futura sem re-fetch.
+                                inserir_partida(cursor, data, m_id, servidor, elo, div)
+
                                 cursor.execute("INSERT INTO partidas_processadas VALUES (?)", (m_id,))
                                 conn.commit()
                                 partidas += 1
