@@ -92,7 +92,12 @@ def _consultar_agregados(where_extra: str, params: list) -> dict:
     tabela de ~100k linhas (ms) em vez de varrer os ~4M de estatisticas_meta a cada request.
     Retorna { 'ELO_DIV': {amostra, kda, ...}, ... }. Cai p/ {} se a tabela ainda não existe
     (agregador não rodou) — o chamador trata o 404/fallback."""
-    medias = ", ".join(f"SUM(soma_{m}) / SUM(n) AS {m}" for m in _METRICAS_ROTA)
+    # kpa usa SUM(n_kpa) como divisor (exclui os zeros bugados antigos do crawler); as demais
+    # métricas seguem com SUM(n) — o bug era exclusivo do kpa. Ver ID_FIX_KPA no agregador.
+    medias = ", ".join(
+        (f"SUM(soma_{m}) / SUM(n_kpa) AS {m}" if m == "kpa" else f"SUM(soma_{m}) / SUM(n) AS {m}")
+        for m in _METRICAS_ROTA
+    )
     query = f"""
         SELECT elo, divisao, SUM(n) AS amostra, {medias}
         FROM estatisticas_agregadas

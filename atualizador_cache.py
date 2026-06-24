@@ -10,6 +10,15 @@ from collections import Counter
 DB = "meu_meta_dataset_global.db"
 INTERVALO = 3600  # cadência-alvo de cada tarefa (medida a partir do INÍCIO de cada ciclo)
 
+# Fronteira do bug de KPA. Os crawlers liam `chal.get('kpa', 0)` em vez de
+# `chal.get('killParticipation', 0)` — a chave 'kpa' nunca existia, então TODA linha antiga
+# entrou com kpa=0 (commit 56e4109, 2026-06-21, corrigiu o coletor). Sem coluna de data, a
+# fronteira é o `id`: a primeira linha com kpa real é id 3.647.311 (não há nenhum kpa>0 antes
+# disso, e ~3,65M zeros formam o prefixo bugado). Regra: um kpa entra na média sse kpa>0 OU
+# id>=ID_FIX_KPA — assim os zeros bugados antigos saem do cálculo, mas qualquer kpa=0 legítimo
+# coletado daqui pra frente (id>=fronteira) continua contando normalmente.
+ID_FIX_KPA = 3647311
+
 # Métricas numéricas agregadas (mesma união usada pelos endpoints por rota/campeão).
 METRICAS_AGG = [
     "kda", "cs_min", "ouro_min", "visao_min", "dano_min", "dano_objetivos",
@@ -53,8 +62,14 @@ def atualizar_tabela_agregada():
         linhas já calculadas + índices. O write-lock fica retido só por segundos.
     Os leitores (API) seguem vendo a tabela ANTIGA até o COMMIT, sem janela de 'tabela inexistente'."""
     somas = ", ".join(f"SUM({m}) AS soma_{m}" for m in METRICAS_AGG)
+    # n_kpa: denominador SÓ do kpa — conta as linhas elegíveis (kpa>0 OU pós-fix), ignorando
+    # os zeros bugados antigos. soma_kpa já está correto (zero bugado soma 0); só o divisor
+    # precisava deixar de incluir o prefixo bugado. Os demais n/soma seguem sobre TODAS as
+    # linhas (o bug era exclusivo do kpa).
     select_agg = f"""
-        SELECT campeao, posicao, elo, divisao, regiao, COUNT(*) AS n, {somas}
+        SELECT campeao, posicao, elo, divisao, regiao, COUNT(*) AS n,
+               SUM(CASE WHEN kpa > 0 OR id >= {ID_FIX_KPA} THEN 1 ELSE 0 END) AS n_kpa,
+               {somas}
         FROM estatisticas_meta
         WHERE elo IS NOT NULL AND divisao IS NOT NULL
           AND posicao IS NOT NULL AND posicao <> ''
@@ -69,8 +84,8 @@ def atualizar_tabela_agregada():
     finally:
         ro.close()
 
-    cols = ["campeao", "posicao", "elo", "divisao", "regiao", "n"] + [f"soma_{m}" for m in METRICAS_AGG]
-    coldefs = ("campeao TEXT, posicao TEXT, elo TEXT, divisao TEXT, regiao TEXT, n INTEGER, "
+    cols = ["campeao", "posicao", "elo", "divisao", "regiao", "n", "n_kpa"] + [f"soma_{m}" for m in METRICAS_AGG]
+    coldefs = ("campeao TEXT, posicao TEXT, elo TEXT, divisao TEXT, regiao TEXT, n INTEGER, n_kpa INTEGER, "
                + ", ".join(f"soma_{m} REAL" for m in METRICAS_AGG))
     placeholders = ", ".join("?" * len(cols))
     dados = [tuple(linha) for linha in linhas]
@@ -181,14 +196,14 @@ def atualizar_cache_benchmarks_rota():
     """Agrega benchmarks por elo + divisao + POSICAO, com todas as métricas relevantes a cada rota."""
     conn = conectar(somente_leitura=True)
     try:
-        query = """
+        query = f"""
             SELECT elo, divisao, posicao, COUNT(*) AS amostra,
                    AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min,
                    AVG(visao_min) AS visao_min, AVG(dano_min) AS dano_min,
                    AVG(dano_objetivos) AS dano_objetivos, AVG(dano_torres) AS dano_torres,
                    AVG(tempo_cc) AS tempo_cc, AVG(pink_wards) AS pink_wards,
                    AVG(cura_total) AS cura_total, AVG(dano_mitigado) AS dano_mitigado,
-                   AVG(kpa) AS kpa, AVG(solo_kills) AS solo_kills,
+                   AVG(CASE WHEN kpa > 0 OR id >= {ID_FIX_KPA} THEN kpa END) AS kpa, AVG(solo_kills) AS solo_kills,
                    AVG(cs_jungle_10m) AS cs_jungle_10m, AVG(cs_rota_10m) AS cs_rota_10m,
                    AVG(pct_dano_time) AS pct_dano_time
             FROM estatisticas_meta
