@@ -48,6 +48,8 @@ UPDATE_SQL = """UPDATE estatisticas_meta SET
     WHERE id=?"""
 
 INTERVALO = 1.3  # s entre chamadas por chave (dev: 100 req/2min → margem segura ~46/min)
+RETRY_EXPIRADA = 300  # s: chave marcada expirada volta a ser RE-SONDADA depois disso
+                      # (um 401/403 espurio nao a mata pra sempre → recupera sozinha)
 
 
 def macro_de(match_id: str):
@@ -68,8 +70,8 @@ class GerenciadorChaves:
         self.nomes = nomes
         self.intervalo = intervalo
         self.lock = threading.Lock()
-        self.chaves = [{"nome": n, "valor": self._ler(n), "next_ok": 0.0, "expirada": False}
-                       for n in nomes]
+        self.chaves = [{"nome": n, "valor": self._ler(n), "next_ok": 0.0,
+                        "expirada": False, "retry_em": 0.0} for n in nomes]
 
     @staticmethod
     def _ler(nome):
@@ -78,16 +80,16 @@ class GerenciadorChaves:
         return v or None
 
     def recarregar(self):
-        """Relê o .env; des-expira a chave cujo valor mudou (nova chave colada). Retorna
-        True se alguma chave voltou a ficar utilizável."""
+        """Relê o .env; des-expira na hora a chave cujo VALOR mudou (você colou uma nova).
+        Chaves falso-expiradas (valor inalterado) recuperam pela re-sondagem em adquirir().
+        Retorna True se alguma chave voltou a ficar utilizável."""
         with self.lock:
             voltou = False
             for c in self.chaves:
                 novo = self._ler(c["nome"])
-                if novo and (novo != c["valor"] or c["expirada"]):
-                    if novo != c["valor"]:
-                        c["valor"], c["expirada"], c["next_ok"] = novo, False, 0.0
-                        voltou = True
+                if novo and novo != c["valor"]:
+                    c["valor"], c["expirada"], c["next_ok"], c["retry_em"] = novo, False, 0.0, 0.0
+                    voltou = True
             return voltou
 
     def adquirir(self):
@@ -95,12 +97,18 @@ class GerenciadorChaves:
         avisou = False
         while True:
             with self.lock:
+                agora = time.time()
+                # chave marcada expirada volta a ser TENTADA apos o cooldown: se foi um
+                # 401/403 espurio (chave ainda valida), ela se recupera sozinha aqui.
+                for c in self.chaves:
+                    if c["expirada"] and c["valor"] and c["retry_em"] <= agora:
+                        c["expirada"] = False
                 disp = [c for c in self.chaves if c["valor"] and not c["expirada"]]
                 if disp:
                     c = min(disp, key=lambda x: x["next_ok"])
-                    espera = c["next_ok"] - time.time()
+                    espera = c["next_ok"] - agora
                     if espera <= 0:
-                        c["next_ok"] = time.time() + self.intervalo
+                        c["next_ok"] = agora + self.intervalo
                         return c
             if not disp:
                 if not avisou:
@@ -122,6 +130,7 @@ class GerenciadorChaves:
                 print(f"❌ Chave {c['nome']} expirou/invalidou (401/403). Usando a outra; "
                       f"cole uma nova no .env quando puder.", flush=True)
             c["expirada"] = True
+            c["retry_em"] = time.time() + RETRY_EXPIRADA  # re-sonda depois (pode ser falso 401/403)
         self.recarregar()  # talvez você já tenha colado a nova
 
     def alguma_valida(self):
