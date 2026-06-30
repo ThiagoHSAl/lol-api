@@ -10,8 +10,22 @@ from ingest_crawler import garantir_colunas, inserir_partida  # rota inferida + 
 # 1. CARREGAMENTO INICIAL DA CHAVE
 # ==========================================
 load_dotenv()
-RAW_KEY = os.getenv("RIOT_API_KEY2")
+KEY_NAME = "RIOT_API_KEY2"  # este crawler usa SEMPRE esta chave (boot e hot-reload)
+RAW_KEY = os.getenv(KEY_NAME)
 RIOT_API_KEY = RAW_KEY.replace('"', '').replace("'", "").strip() if RAW_KEY else None
+
+INTERVALO = 1.25       # s entre QUALQUER requisição (dev: 100/2min = 1.2s + folga p/ jitter)
+_ultimo_req = 0.0
+
+
+def _aguardar_pace():
+    """Garante >= INTERVALO s desde a requisição anterior. Paceia TODA chamada (não só as
+    que viram partida salva) — é o que evita estourar o limite da chave."""
+    global _ultimo_req
+    espera = _ultimo_req + INTERVALO - time.time()
+    if espera > 0:
+        time.sleep(espera)
+    _ultimo_req = time.time()
 
 if not RIOT_API_KEY:
     print("❌ Erro FATAL: RIOT_API_KEY não encontrada no .env inicial.")
@@ -88,35 +102,44 @@ def configurar_banco():
 # ==========================================
 def chamada_api(url):
     global RIOT_API_KEY
-    headers = {"X-Riot-Token": RIOT_API_KEY}
-    
-    try:
-        res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code == 200: return res.json()
-        
-        if res.status_code in [401, 403]:
-            print(f"\n❌ CHAVE EXPIRADA (Erro {res.status_code})!")
-            print("⏳ Cole a nova chave no arquivo .env e salve.")
-            print("⏳ O Crawler verificará o arquivo novamente em 60 segundos...")
-            time.sleep(60)
-            
-            load_dotenv(override=True) 
-            novo_raw = os.getenv("RIOT_API_KEY")
-            RIOT_API_KEY = novo_raw.replace('"', '').replace("'", "").strip() if novo_raw else None
-            
-            print("🔄 Nova chave detectada! Retomando coleta...")
-            return chamada_api(url)
-            
-        if res.status_code == 429:
-            wait = int(res.headers.get('Retry-After', 10))
-            print(f"   ⏳ Rate Limit! Pausa de {wait}s...")
-            time.sleep(wait + 1)
-            return chamada_api(url) 
-            
-        return None
-    except Exception as e:
-        print(f"   ⚠️ Erro de rede: {e}")
-        return None
+    tentativas_429 = 0
+    while True:
+        _aguardar_pace()  # pace por REQUISIÇÃO (toda chamada, não só as bem-sucedidas)
+        try:
+            res = requests.get(url, headers={"X-Riot-Token": RIOT_API_KEY}, timeout=15)
+        except Exception as e:
+            print(f"   ⚠️ Erro de rede: {e}")
+            return None
+
+        sc = res.status_code
+        if sc == 200:
+            return res.json()
+
+        if sc in (401, 403):
+            # Hot-reload SEM recursão: espera até aparecer uma chave NOVA no .env
+            # (mesma KEY_NAME do boot — não troca de chave por engano).
+            print(f"\n❌ CHAVE EXPIRADA (Erro {sc})! Cole a nova em {KEY_NAME} no .env e salve.")
+            atual = RIOT_API_KEY
+            while True:
+                time.sleep(60)
+                load_dotenv(override=True)
+                novo_raw = os.getenv(KEY_NAME)
+                novo = novo_raw.replace('"', '').replace("'", "").strip() if novo_raw else None
+                if novo and novo != atual:
+                    RIOT_API_KEY = novo
+                    print("🔄 Nova chave detectada! Retomando coleta...")
+                    break
+                print("⏳ Ainda sem chave nova; verifico de novo em 60s...")
+            continue
+
+        if sc == 429:
+            tentativas_429 += 1
+            wait = min(int(res.headers.get("Retry-After", 5)) + tentativas_429, 30)
+            print(f"   ⏳ Rate Limit (429)! Pausa de {wait}s...")
+            time.sleep(wait)
+            continue
+
+        return None  # 4xx/5xx não tratados
 
 # ==========================================
 # 5. LOOP DE COLETA (Extração de Alta Densidade)
@@ -174,7 +197,7 @@ def iniciar_crawler():
                                 conn.commit()
                                 partidas += 1
                                 print(f"   ✅ [{servidor.upper()} - {elo} {div}] Partidas Coletadas: {partidas}/{PARTIDAS_POR_SUBELO}")
-                                time.sleep(1.2)
+                                # pace por requisição agora é central (_aguardar_pace em chamada_api)
             
             print(f"\n✅ Ciclo {ciclo} concluído em todas as regiões!")
             ciclo += 1
