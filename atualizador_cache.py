@@ -265,12 +265,16 @@ def atualizar_cache_panorama():
                 campeoes_db = conn.execute(
                     """
                     SELECT campeao, COUNT(*) AS total_partidas,
-                           SUM(vitoria) * 100.0 / COUNT(*) AS winrate
+                           SUM(vitoria) * 100.0 / COUNT(*) AS winrate,
+                           ( ( (SUM(vitoria)*1.0/COUNT(*)) + 5.4289/(2*COUNT(*))
+                               - 2.33*sqrt( ((SUM(vitoria)*1.0/COUNT(*))*(1-(SUM(vitoria)*1.0/COUNT(*)))
+                                            + 5.4289/(4*COUNT(*)))/COUNT(*) ) )
+                             / (1 + 5.4289/COUNT(*)) ) AS wilson_lb
                     FROM estatisticas_meta
                     WHERE elo = ? AND posicao = ?
                     GROUP BY campeao
-                    HAVING total_partidas > 50
-                    ORDER BY winrate DESC
+                    HAVING total_partidas >= 100
+                    ORDER BY wilson_lb DESC
                     LIMIT 10
                     """,
                     (elo, posicao),
