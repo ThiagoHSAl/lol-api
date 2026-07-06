@@ -11,6 +11,7 @@ app = FastAPI(title="LoL AI Tutor - Benchmarks API")
 ARQUIVO_CACHE = "cache_benchmarks.json"
 ARQUIVO_CACHE_PANORAMA = "cache_panorama.json"
 ARQUIVO_CACHE_ROTA = "cache_benchmarks_rota.json"
+ARQUIVO_CACHE_PERCENTIS = "cache_percentis_rota.json"
 
 POSICOES_VALIDAS = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 
@@ -132,12 +133,30 @@ def _rota_bench_por_regiao(posicao: str, regiao: str) -> dict:
         [posicao, regiao],
     )
 
+def _anexar_percentis(bench: dict, posicao: str) -> dict:
+    """Anexa a grade de percentis (p5..p95, cache DIÁRIO do agregador) a cada bloco de
+    elo, em bloco['percentis'] = {metrica: [19 valores]}. Os percentis são sempre
+    GLOBAIS (sem recorte de região): o pré-agregado regional só guarda somas, e a
+    distribuição por elo é estável entre regiões."""
+    if not os.path.exists(ARQUIVO_CACHE_PERCENTIS):
+        return bench
+    with open(ARQUIVO_CACHE_PERCENTIS, "r") as f:
+        percentis = json.load(f)
+    for elo, bloco in bench.items():
+        grade = percentis.get(elo, {}).get(posicao)
+        if grade:
+            bloco["percentis"] = {m: v for m, v in grade.items() if m != "amostra"}
+            bloco["percentis_amostra"] = grade.get("amostra")
+    return bench
+
 def _bench_por_elo(posicao: str, regiao: str = None) -> dict:
     """Retorna { 'ELO_DIV': {metricas} } de uma rota: por região (DB) ou global (cache)."""
     if regiao:
-        return _rota_bench_por_regiao(posicao, regiao)
-    dados = ler_cache_rota()
-    return {chave: bloco[posicao] for chave, bloco in dados.items() if posicao in bloco}
+        bench = _rota_bench_por_regiao(posicao, regiao)
+    else:
+        dados = ler_cache_rota()
+        bench = {chave: bloco[posicao] for chave, bloco in dados.items() if posicao in bloco}
+    return _anexar_percentis(bench, posicao)
 
 def _bench_por_campeoes(posicao: str, campeoes: list, regiao: str = None) -> dict:
     """Agrega o benchmark de uma rota restrito a uma LISTA de campeões (mono = 1 nome,
@@ -240,8 +259,11 @@ def obter_benchmark_rota(posicao: str, elo: str, divisao: str = None, regiao: Op
 
     media = {}
     for metrica in blocos[0].keys():
-        valores = [b[metrica] for b in blocos if metrica in b]
-        media[metrica] = round(sum(valores) / len(valores), 4)
+        # Grades de percentis (listas) não são "mediáveis" entre divisões → ficam de fora.
+        valores = [b[metrica] for b in blocos
+                   if isinstance(b.get(metrica), (int, float))]
+        if valores:
+            media[metrica] = round(sum(valores) / len(valores), 4)
 
     return {"elo": elo, "posicao": posicao, "benchmark": media}
 
