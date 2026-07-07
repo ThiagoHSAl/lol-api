@@ -156,6 +156,35 @@ def obter_mapa_de_itens_finais() -> dict:
             return {}
 
 
+def obter_mapa_botas() -> dict:
+    """Mapa id -> nome só das BOTAS compráveis (tier 2+, custo > 500 — exclui a Bota
+    básica de 300). O panorama conta as botas num ranking próprio ('top_2_botas'),
+    separado dos itens finais. Mesmo padrão de backup local do mapa de itens."""
+    arquivo_backup = "backup_botas.json"
+    try:
+        url_versoes = "https://ddragon.leagueoflegends.com/api/versions.json"
+        patch_atual = requests.get(url_versoes, timeout=5).json()[0]
+        url_itens = f"https://ddragon.leagueoflegends.com/cdn/{patch_atual}/data/pt_BR/item.json"
+        dados_itens = requests.get(url_itens, timeout=10).json()["data"]
+
+        mapa_botas = {
+            item_id: detalhes["name"]
+            for item_id, detalhes in dados_itens.items()
+            if "Boots" in detalhes.get("tags", [])
+            and detalhes.get("gold", {}).get("total", 0) > 500
+        }
+        with open(arquivo_backup, "w") as f:
+            json.dump(mapa_botas, f)
+        return mapa_botas
+    except Exception as e:
+        print(f"⚠️ Servidor da Riot falhou ({e}). Tentando usar o cache local de botas...")
+        if os.path.exists(arquivo_backup):
+            with open(arquivo_backup, "r") as f:
+                return json.load(f)
+        print("❌ Nenhum cache local de botas encontrado.")
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # 2) BENCHMARKS BASE (somente leitura)
 # ---------------------------------------------------------------------------
@@ -320,6 +349,9 @@ def atualizar_cache_panorama():
       • os itens são lidos em LOTE, uma query por combo com 'campeao IN (top10)', tocando só
         as linhas daquele elo/rota dos 10 campeões — em vez de 1 varredura por campeão."""
     mapa_itens_finais = obter_mapa_de_itens_finais()
+    # Botas têm ranking PRÓPRIO ('top_2_botas') e saem do top-5 de itens — sem isso
+    # elas competiam pelos 5 slots e o card não tinha a informação de bota separada.
+    mapa_botas = obter_mapa_botas()
     elos = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"]
     posicoes = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 
@@ -349,6 +381,7 @@ def atualizar_cache_panorama():
 
                 top_campeoes = [r["campeao"] for r in campeoes_db]
                 contadores = {c: Counter() for c in top_campeoes}
+                contadores_botas = {c: Counter() for c in top_campeoes}
 
                 if top_campeoes:
                     placeholders = ", ".join("?" * len(top_campeoes))
@@ -365,9 +398,12 @@ def atualizar_cache_panorama():
                             continue
                         lista_ids = json.loads(itens_str) if "[" in itens_str else itens_str.split(",")
                         contador = contadores[linha["campeao"]]
+                        contador_botas = contadores_botas[linha["campeao"]]
                         for item_id in lista_ids:
                             item_id = str(item_id).strip()
-                            if item_id in mapa_itens_finais:
+                            if item_id in mapa_botas:
+                                contador_botas[item_id] += 1
+                            elif item_id in mapa_itens_finais:
                                 contador[item_id] += 1
 
                 top_10 = []
@@ -375,11 +411,14 @@ def atualizar_cache_panorama():
                     campeao = champ_row["campeao"]
                     top_5_ids = [item_id for item_id, _ in contadores[campeao].most_common(5)]
                     top_5_nomes = [mapa_itens_finais[i] for i in top_5_ids]
+                    top_2_botas = [mapa_botas[i] for i, _ in
+                                   contadores_botas[campeao].most_common(2)]
                     top_10.append({
                         "campeao": campeao,
                         "winrate": round(champ_row["winrate"], 2),
                         "amostra": champ_row["total_partidas"],
                         "top_5_itens": top_5_nomes,
+                        "top_2_botas": top_2_botas,
                     })
 
                 panorama_elo[posicao] = top_10
