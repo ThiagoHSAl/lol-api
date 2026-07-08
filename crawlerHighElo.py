@@ -5,27 +5,19 @@ import sqlite3
 import random
 from dotenv import load_dotenv
 from ingest_crawler import garantir_colunas, inserir_partida  # rota inferida + sinais crus
+from riot_pacer import PACER  # pace GLOBAL cross-process (chave unica compartilhada)
 
 # ==========================================
 # 1. CARREGAMENTO INICIAL DA CHAVE
 # ==========================================
+# DORMENTE ate a production key da Riot: nao rodar este crawler com a personal
+# key (ela atende so o app EloRise ao vivo). Quando a production key sair, basta
+# cola-la em RIOT_API_KEY no .env — o pacer le os limites reais do header
+# X-App-Rate-Limit na primeira resposta e ajusta o ritmo sozinho.
 load_dotenv()
-KEY_NAME = "RIOT_API_KEY"  # este crawler usa SEMPRE esta chave (boot e hot-reload)
+KEY_NAME = "RIOT_API_KEY"  # chave UNICA do produto (boot e hot-reload leem a mesma)
 RAW_KEY = os.getenv(KEY_NAME)
 RIOT_API_KEY = RAW_KEY.replace('"', '').replace("'", "").strip() if RAW_KEY else None
-
-INTERVALO = 1.25       # s entre QUALQUER requisição (dev: 100/2min = 1.2s + folga p/ jitter)
-_ultimo_req = 0.0
-
-
-def _aguardar_pace():
-    """Garante >= INTERVALO s desde a requisição anterior. Paceia TODA chamada (não só as
-    que viram partida salva) — é o que evita estourar o limite da chave."""
-    global _ultimo_req
-    espera = _ultimo_req + INTERVALO - time.time()
-    if espera > 0:
-        time.sleep(espera)
-    _ultimo_req = time.time()
 
 if not RIOT_API_KEY:
     print("❌ Erro FATAL: RIOT_API_KEY não encontrada no .env inicial.")
@@ -84,13 +76,14 @@ def chamada_api(url):
     global RIOT_API_KEY
     tentativas_429 = 0
     while True:
-        _aguardar_pace()  # pace por REQUISIÇÃO (toda chamada, não só as bem-sucedidas)
+        PACER.aguardar()  # slot global por REQUISIÇÃO — compartilhado entre processos
         try:
             res = requests.get(url, headers={"X-Riot-Token": RIOT_API_KEY}, timeout=15)
         except Exception as e:
             print(f"   ⚠️ Erro de rede: {e}")
             return None
 
+        PACER.observar(res.headers)  # ajusta o ritmo pelo X-App-Rate-Limit real
         sc = res.status_code
         if sc == 200:
             return res.json()
@@ -115,8 +108,8 @@ def chamada_api(url):
         if sc == 429:
             tentativas_429 += 1
             wait = min(int(res.headers.get("Retry-After", 5)) + tentativas_429, 30)
-            print(f"   ⏳ Rate Limit (429)! Pausa de {wait}s...")
-            time.sleep(wait)
+            print(f"   ⏳ Rate Limit (429)! Pausa GLOBAL de {wait}s...")
+            PACER.penalizar(wait)  # empurra o slot de TODOS os processos, não só este
             continue
 
         return None  # 4xx/5xx não tratados
@@ -180,7 +173,7 @@ def iniciar_crawler_apex():
                             conn.commit()
                             partidas_coletadas += 1
                             print(f"   ✅ [{servidor.upper()} - {elo}] Partidas Coletadas: {partidas_coletadas}/{META_PARTIDAS_POR_ELO}")
-                            # pace por requisição agora é central (_aguardar_pace em chamada_api)
+                            # pace por requisição é central e cross-process (PACER.aguardar em chamada_api)
             
             print(f"\n✅ Ciclo {ciclo} High Elo concluído!")
             ciclo += 1
