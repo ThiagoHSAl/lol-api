@@ -34,7 +34,9 @@ ORDEM_ELOS = [
 # ROTAS ESTÁTICAS (CACHE ULTRA RÁPIDO)
 # ==========================================
 
-@app.get("/health")
+# HEAD explícito: o monitor HTTP do UptimeRobot sonda com HEAD por padrão e o
+# FastAPI NÃO deriva HEAD de @app.get sozinho (respondia 405 = incidente falso).
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     """Sonda de uptime (UptimeRobot etc.). Barata de propósito: não toca o SQLite —
     reporta a idade dos caches que o atualizador regenera; um atualizador morto
