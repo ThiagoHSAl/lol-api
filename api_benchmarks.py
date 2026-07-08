@@ -4,6 +4,7 @@ import requests
 from functools import lru_cache
 import json
 import os
+import time
 from typing import Optional
 
 app = FastAPI(title="LoL AI Tutor - Benchmarks API")
@@ -32,6 +33,26 @@ ORDEM_ELOS = [
 # ==========================================
 # ROTAS ESTÁTICAS (CACHE ULTRA RÁPIDO)
 # ==========================================
+
+@app.get("/health")
+def health():
+    """Sonda de uptime (UptimeRobot etc.). Barata de propósito: não toca o SQLite —
+    reporta a idade dos caches que o atualizador regenera; um atualizador morto
+    aparece aqui como cache envelhecendo (idade em horas subindo sem parar)."""
+    caches = {}
+    for nome, arq in (
+        ("benchmarks", ARQUIVO_CACHE),
+        ("panorama", ARQUIVO_CACHE_PANORAMA),
+        ("rota", ARQUIVO_CACHE_ROTA),
+        ("percentis", ARQUIVO_CACHE_PERCENTIS),
+    ):
+        caches[nome] = (
+            round((time.time() - os.path.getmtime(arq)) / 3600, 2)
+            if os.path.exists(arq)
+            else None
+        )
+    return {"status": "ok", "idade_caches_horas": caches}
+
 
 def ler_cache():
     if not os.path.exists(ARQUIVO_CACHE):
