@@ -74,6 +74,7 @@ def atualizar_tabela_agregada():
         WHERE elo IS NOT NULL AND divisao IS NOT NULL
           AND posicao IS NOT NULL AND posicao <> ''
           AND regiao IS NOT NULL AND campeao IS NOT NULL
+          AND COALESCE(fila, 'solo') = 'solo'
         GROUP BY campeao, posicao, elo, divisao, regiao
     """
 
@@ -197,6 +198,7 @@ def atualizar_cache_benchmarks():
                    AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min, AVG(visao_min) AS visao_min
             FROM estatisticas_meta
             WHERE elo IS NOT NULL AND divisao IS NOT NULL
+              AND COALESCE(fila, 'solo') = 'solo'
             GROUP BY elo, divisao
         """
         linhas = conn.execute(query).fetchall()
@@ -238,6 +240,7 @@ def atualizar_cache_benchmarks_rota():
             FROM estatisticas_meta
             WHERE elo IS NOT NULL AND divisao IS NOT NULL
               AND posicao IS NOT NULL AND posicao <> ''
+              AND COALESCE(fila, 'solo') = 'solo'
             GROUP BY elo, divisao, posicao
             HAVING COUNT(*) >= 20
         """
@@ -304,6 +307,7 @@ def atualizar_cache_percentis_rota():
             FROM estatisticas_meta
             WHERE elo IS NOT NULL AND divisao IS NOT NULL
               AND posicao IS NOT NULL AND posicao <> ''
+              AND COALESCE(fila, 'solo') = 'solo'
             GROUP BY elo, divisao, posicao
             HAVING COUNT(*) >= 100
         """).fetchall()
@@ -313,7 +317,8 @@ def atualizar_cache_percentis_rota():
         for g in grupos:
             linhas = conn.execute(
                 f"SELECT id, {colunas} FROM estatisticas_meta "
-                "WHERE elo = ? AND divisao = ? AND posicao = ?",
+                "WHERE elo = ? AND divisao = ? AND posicao = ? "
+                "AND COALESCE(fila, 'solo') = 'solo'",
                 (g["elo"], g["divisao"], g["posicao"]),
             ).fetchall()
             bloco = {"amostra": len(linhas)}
@@ -371,6 +376,7 @@ def atualizar_cache_panorama():
                              / (1 + 5.4289/COUNT(*)) ) AS wilson_lb
                     FROM estatisticas_meta
                     WHERE elo = ? AND posicao = ?
+                      AND COALESCE(fila, 'solo') = 'solo'
                     GROUP BY campeao
                     HAVING total_partidas >= 100
                     ORDER BY wilson_lb DESC
@@ -389,6 +395,7 @@ def atualizar_cache_panorama():
                         f"""
                         SELECT campeao, itens FROM estatisticas_meta
                         WHERE elo = ? AND posicao = ? AND campeao IN ({placeholders})
+                          AND COALESCE(fila, 'solo') = 'solo'
                         """,
                         (elo, posicao, *top_campeoes),
                     )

@@ -5,19 +5,29 @@ import sqlite3
 import random
 from dotenv import load_dotenv
 from ingest_crawler import garantir_colunas, inserir_partida  # rota inferida + sinais crus
-from riot_pacer import PACER  # pace GLOBAL cross-process (chave unica compartilhada)
+from riot_pacer import RiotPacer
 
 # ==========================================
 # 1. CARREGAMENTO INICIAL DA CHAVE
 # ==========================================
-# DORMENTE ate a production key da Riot: nao rodar este crawler com a personal
-# key (ela atende so o app EloRise ao vivo). Quando a production key sair, basta
-# cola-la em RIOT_API_KEY no .env — o pacer le os limites reais do header
-# X-App-Rate-Limit na primeira resposta e ajusta o ritmo sozinho.
+# Este crawler (MASTER/GM/CHALLENGER) usa a DEV KEY 2 — chave própria, orçamento
+# independente do crawler.py. A personal key é EXCLUSIVA do app EloRise. Dev keys
+# expiram a cada 24h; o hot-reload (401/403) espera a nova em RIOT_DEV_KEY2 no .env.
 load_dotenv()
-KEY_NAME = "RIOT_API_KEY"  # chave UNICA do produto (boot e hot-reload leem a mesma)
+KEY_NAME = "RIOT_DEV_KEY2"  # dev key 2 (boot e hot-reload leem a mesma)
 RAW_KEY = os.getenv(KEY_NAME)
 RIOT_API_KEY = RAW_KEY.replace('"', '').replace("'", "").strip() if RAW_KEY else None
+
+# Arquivo de estado PRÓPRIO (.pacer_dev2): pacing independente do crawler.py, que
+# roda na outra dev key. fator 0.9 (chave dedicada, só pequena folga).
+PACER = RiotPacer(
+    arquivo=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pacer_dev2.json"),
+    fator_uso=0.9,
+)
+
+# Filas coletadas e o queueId da Riot. Só 'solo' alimenta rota/benchmark do app;
+# flex e normal ficam no mesmo DB, separados pela coluna `fila`.
+FILAS = {"solo": 420, "flex": 440, "normal": 400}
 
 if not RIOT_API_KEY:
     print("❌ Erro FATAL: RIOT_API_KEY não encontrada no .env inicial.")
@@ -132,48 +142,51 @@ def iniciar_crawler_apex():
                 print(f"\n🌍 VARREDURA APEX NO SERVIDOR: {servidor.upper()}")
                 
                 for elo, endpoint in ELOS_APEX.items():
-                    print(f"\n🌟 [{servidor.upper()}] Buscando a elite: {elo} (Meta: {META_PARTIDAS_POR_ELO} partidas)")
-                    partidas_coletadas = 0
-                    
-                    # Rota específica da Riot para Ligas Apex
+                    # Liga apex é buscada UMA vez por elo e reusada nas 3 filas.
                     url_liga = f"https://{servidor}.api.riotgames.com/lol/league/v4/{endpoint}/by-queue/RANKED_SOLO_5x5"
                     resposta = chamada_api(url_liga)
-                    
+
                     # Nos elos Apex, a Riot devolve um Dicionário. Os jogadores estão na chave 'entries'
                     jogadores = resposta.get('entries', []) if isinstance(resposta, dict) else []
-                    
+
                     if not jogadores:
                         print(f"   ⚠️ Nenhum jogador encontrado em {elo}. Pulando...")
                         continue
-                    
-                    random.shuffle(jogadores) 
-                    
-                    for j in jogadores:
-                        if partidas_coletadas >= META_PARTIDAS_POR_ELO: break
-                        
-                        puuid = j.get('puuid')
-                        if not puuid: continue
-                        
-                        match_ids = chamada_api(f"https://{macro_regiao}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?queue=420&start=0&count=5")
-                        if not match_ids: continue
-                        
-                        for m_id in match_ids:
+
+                    random.shuffle(jogadores)
+
+                    for fila, queue_id in FILAS.items():
+                        print(f"\n🌟 [{servidor.upper()}] {elo} | fila={fila} (Meta: {META_PARTIDAS_POR_ELO})")
+                        partidas_coletadas = 0
+
+                        for j in jogadores:
                             if partidas_coletadas >= META_PARTIDAS_POR_ELO: break
-                            
-                            if cursor.execute("SELECT 1 FROM partidas_processadas WHERE match_id = ?", (m_id,)).fetchone(): continue
-                            
-                            data = chamada_api(f"https://{macro_regiao}.api.riotgames.com/lol/match/v5/matches/{m_id}")
-                            if not data or data['info'].get('gameDuration', 0) < 300: continue
 
-                            # Rota inferida (não o teamPosition cru) + sinais crus persistidos;
-                            # divisão padrão "I" para manter a sanidade do banco de dados.
-                            inserir_partida(cursor, data, m_id, servidor, elo, "I")
+                            puuid = j.get('puuid')
+                            if not puuid: continue
 
-                            cursor.execute("INSERT INTO partidas_processadas VALUES (?)", (m_id,))
-                            conn.commit()
-                            partidas_coletadas += 1
-                            print(f"   ✅ [{servidor.upper()} - {elo}] Partidas Coletadas: {partidas_coletadas}/{META_PARTIDAS_POR_ELO}")
-                            # pace por requisição é central e cross-process (PACER.aguardar em chamada_api)
+                            match_ids = chamada_api(f"https://{macro_regiao}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queue_id}&start=0&count=5")
+                            if not match_ids: continue
+
+                            for m_id in match_ids:
+                                if partidas_coletadas >= META_PARTIDAS_POR_ELO: break
+
+                                if cursor.execute("SELECT 1 FROM partidas_processadas WHERE match_id = ?", (m_id,)).fetchone(): continue
+
+                                data = chamada_api(f"https://{macro_regiao}.api.riotgames.com/lol/match/v5/matches/{m_id}")
+                                if not data or data['info'].get('gameDuration', 0) < 300: continue
+
+                                # Timeline só APÓS o filtro de duração — dela saem as botas compradas.
+                                timeline = chamada_api(f"https://{macro_regiao}.api.riotgames.com/lol/match/v5/matches/{m_id}/timeline")
+
+                                # Rota inferida + sinais crus + fila + botas; divisão padrão "I" no apex.
+                                inserir_partida(cursor, data, m_id, servidor, elo, "I", fila=fila, timeline=timeline)
+
+                                cursor.execute("INSERT INTO partidas_processadas VALUES (?)", (m_id,))
+                                conn.commit()
+                                partidas_coletadas += 1
+                                print(f"   ✅ [{servidor.upper()} - {elo} {fila}] Coletadas: {partidas_coletadas}/{META_PARTIDAS_POR_ELO}")
+                                # pace por requisição é central (PACER.aguardar em chamada_api)
             
             print(f"\n✅ Ciclo {ciclo} High Elo concluído!")
             ciclo += 1

@@ -9,6 +9,10 @@ Em vez de gravar o `teamPosition` cru, cruza os sinais da match-v5 (ver deteccao
     team_id) para que mudanças FUTURAS na lógica re-derivem do DB, SEM re-buscar a API.
 """
 
+import json
+import os
+import requests
+
 from deteccao_rota import inferir_rotas_partida
 
 # Colunas adicionadas para guardar os sinais crus (idempotente via garantir_colunas).
@@ -22,9 +26,16 @@ COLUNAS_NOVAS = [
     ("summoner1_id", "INTEGER"),
     ("summoner2_id", "INTEGER"),
     ("posicao_apoio", "INTEGER"),       # nº de sinais que concordaram com a rota inferida
+    # fila DEFAULT 'solo': os 4,3M de registros pré-existentes são TODOS queue 420 (solo).
+    # O DEFAULT faz o SQLite tratá-los como 'solo' sem reescrever a tabela — sem ele, as
+    # agregações (que filtram fila='solo') perderiam todo o histórico. Ver as queries do app.
+    ("fila", "TEXT DEFAULT 'solo'"),    # 'solo' | 'flex' | 'normal'
+    # botas_compradas: IDs de bota comprados na timeline, em ordem. Corrige o top_2_botas
+    # (o inventário final quase nunca tem bota — vendida no late; ver a investigação de 08/07).
+    ("botas_compradas", "TEXT"),        # NULL para dados antigos (sem timeline)
 ]
 
-# 31 colunas originais + 9 novas = 40
+# 31 colunas originais + 11 novas = 42
 _COLUNAS_INSERT = (
     "match_id, regiao, elo, divisao, campeao, posicao, vitoria, "
     "kda, cs_min, ouro_min, visao_min, dano_min, itens, "
@@ -32,12 +43,56 @@ _COLUNAS_INSERT = (
     "cura_total, dano_mitigado, tempo_vivo, first_blood, fb_assist, "
     "pings_perigo, pings_ajuda, pings_mia, "
     "kpa, skillshots_desviadas, solo_kills, cs_jungle_10m, cs_rota_10m, pct_dano_time, "
-    "puuid, team_id, team_position, individual_position, lane, role, summoner1_id, summoner2_id, posicao_apoio"
+    "puuid, team_id, team_position, individual_position, lane, role, summoner1_id, summoner2_id, posicao_apoio, "
+    "fila, botas_compradas"
 )
 _SQL_INSERT = (
     f"INSERT INTO estatisticas_meta ({_COLUNAS_INSERT}) VALUES ("
-    + ",".join(["?"] * 40) + ")"
+    + ",".join(["?"] * 42) + ")"
 )
+
+# ---------------------------------------------------------------------------
+# Botas compradas (da timeline) — mapa de IDs de bota, carregado uma vez.
+# ---------------------------------------------------------------------------
+_BOTAS_IDS = None
+
+
+def _ids_de_botas() -> set:
+    """Conjunto de IDs de TODOS os itens com tag Boots (inclui a Bota básica 1001).
+    Carregado uma vez do DDragon, com backup local — mesmo padrão do atualizador."""
+    global _BOTAS_IDS
+    if _BOTAS_IDS is not None:
+        return _BOTAS_IDS
+    backup = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backup_botas_ids.json")
+    try:
+        v = requests.get("https://ddragon.leagueoflegends.com/api/versions.json", timeout=5).json()[0]
+        itens = requests.get(
+            f"https://ddragon.leagueoflegends.com/cdn/{v}/data/pt_BR/item.json", timeout=10
+        ).json()["data"]
+        _BOTAS_IDS = {i for i, d in itens.items() if "Boots" in d.get("tags", [])}
+        with open(backup, "w") as f:
+            json.dump(sorted(_BOTAS_IDS), f)
+    except Exception:
+        if os.path.exists(backup):
+            with open(backup) as f:
+                _BOTAS_IDS = set(json.load(f))
+        else:
+            _BOTAS_IDS = set()  # sem botas conhecidas → botas_compradas fica NULL (degradação segura)
+    return _BOTAS_IDS
+
+
+def _botas_por_participante(timeline: dict) -> dict:
+    """participantId (1-10) -> lista de IDs de bota comprados, em ordem de compra.
+    Lê os eventos ITEM_PURCHASED da timeline da Match-V5; ignora itens não-bota."""
+    ids_botas = _ids_de_botas()
+    out: dict = {}
+    for frame in (timeline or {}).get("info", {}).get("frames", []):
+        for ev in frame.get("events", []):
+            if ev.get("type") == "ITEM_PURCHASED":
+                iid = str(ev.get("itemId"))
+                if iid in ids_botas:
+                    out.setdefault(ev.get("participantId"), []).append(iid)
+    return out
 
 
 def garantir_colunas(conn):
@@ -49,8 +104,9 @@ def garantir_colunas(conn):
     conn.commit()
 
 
-def linha_participante(p: dict, m_id, servidor, elo, div, posicao, apoio, duracao_min) -> tuple:
-    """Constrói a tupla de 40 valores de UM participante (ordem de _SQL_INSERT)."""
+def linha_participante(p: dict, m_id, servidor, elo, div, posicao, apoio, duracao_min,
+                       fila, botas_str) -> tuple:
+    """Constrói a tupla de 42 valores de UM participante (ordem de _SQL_INSERT)."""
     kda = (p["kills"] + p["assists"]) / max(1, p["deaths"])
     cs = p.get("totalMinionsKilled", 0) + p.get("neutralMinionsKilled", 0)
     dano = p.get("totalDamageDealtToChampions", 0)
@@ -77,25 +133,34 @@ def linha_participante(p: dict, m_id, servidor, elo, div, posicao, apoio, duraca
         # Sinais crus (novas colunas) — para re-derivação futura sem re-fetch
         p.get("puuid"), p.get("teamId"), p.get("teamPosition"), p.get("individualPosition"),
         p.get("lane"), p.get("role"), p.get("summoner1Id"), p.get("summoner2Id"), apoio,
+        # Fila e botas compradas (da timeline)
+        fila, botas_str,
     )
 
 
-def inserir_partida(cursor, data: dict, m_id, servidor, elo, div) -> tuple[int, int]:
+def inserir_partida(cursor, data: dict, m_id, servidor, elo, div,
+                    fila: str = "solo", timeline: dict = None) -> tuple[int, int]:
     """Insere os participantes de UMA partida com a rota inferida.
+    `fila` é 'solo' | 'flex' | 'normal'; `timeline` (opcional) é a Match-V5 timeline,
+    de onde extraímos as botas realmente compradas por participante.
     Retorna (inseridos, descartados). NÃO faz commit nem marca partidas_processadas —
     quem chama controla isso (mantém o fluxo atual do crawler)."""
     info = data["info"]
     duracao_min = info["gameDuration"] / 60.0
     rotas = inferir_rotas_partida(info)
+    botas_map = _botas_por_participante(timeline) if timeline else {}
     inseridos = descartados = 0
     for p in info["participants"]:
         inf = rotas.get(p.get("puuid"), {})
         if not inf.get("confiavel"):
             descartados += 1
             continue  # rota indeduzível (swap/autofill ambíguo) → fora do dataset
+        botas_ids = botas_map.get(p.get("participantId"))
+        botas_str = ",".join(botas_ids) if botas_ids else None
         cursor.execute(
             _SQL_INSERT,
-            linha_participante(p, m_id, servidor, elo, div, inf["rota"], inf.get("apoio"), duracao_min),
+            linha_participante(p, m_id, servidor, elo, div, inf["rota"], inf.get("apoio"),
+                               duracao_min, fila, botas_str),
         )
         inseridos += 1
     return inseridos, descartados

@@ -57,6 +57,7 @@ def atualizar_cache_percentis_rota():
             FROM estatisticas_meta
             WHERE elo IS NOT NULL AND divisao IS NOT NULL
               AND posicao IS NOT NULL AND posicao <> ''
+              AND COALESCE(fila, 'solo') = 'solo'
             GROUP BY elo, divisao, posicao
             HAVING COUNT(*) >= 100
         """).fetchall()
@@ -66,7 +67,8 @@ def atualizar_cache_percentis_rota():
         for g in grupos:
             linhas = conn.execute(
                 f"SELECT id, {colunas} FROM estatisticas_meta "
-                "WHERE elo = ? AND divisao = ? AND posicao = ?",
+                "WHERE elo = ? AND divisao = ? AND posicao = ? "
+                "AND COALESCE(fila, 'solo') = 'solo'",
                 (g["elo"], g["divisao"], g["posicao"]),
             ).fetchall()
             bloco = {"amostra": len(linhas)}

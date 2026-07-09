@@ -421,9 +421,9 @@ def pesquisa_avancada(
             AVG(cs_jungle_10m) as cs_jungle_10m,
             AVG(cs_rota_10m) as cs_rota_10m
         FROM estatisticas_meta
-        WHERE 1=1
+        WHERE COALESCE(fila, 'solo') = 'solo'
     """
-    
+
     parametros = []
     
     if campeao:
