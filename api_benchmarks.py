@@ -15,6 +15,24 @@ ARQUIVO_CACHE_ROTA = "cache_benchmarks_rota.json"
 ARQUIVO_CACHE_PERCENTIS = "cache_percentis_rota.json"
 
 POSICOES_VALIDAS = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
+FILAS_VALIDAS = {"solo", "flex", "normal"}
+
+
+def _validar_fila(fila: Optional[str]) -> str:
+    """Fila do seletor do app (default solo). Valida contra o conjunto suportado."""
+    fila = (fila or "solo").lower()
+    if fila not in FILAS_VALIDAS:
+        raise HTTPException(status_code=400, detail=f"Fila inválida. Use: {', '.join(sorted(FILAS_VALIDAS))}")
+    return fila
+
+
+def _slice_fila(cache: dict, fila: str) -> dict:
+    """Os caches agora são NINHADOS por fila: {'solo':{...}, 'flex':{...}, 'normal':{...}}.
+    Tolera o formato ANTIGO (plano, sem fila no topo = só solo) durante a janela de deploy:
+    antes do 1º ciclo do atualizador novo, o cache ainda pode estar plano."""
+    if any(k in cache for k in FILAS_VALIDAS):     # já ninhado
+        return cache.get(fila, {})
+    return cache if fila == "solo" else {}          # plano antigo = solo
 
 # ==========================================
 # ORDEM HIERÁRQUICA DO LEAGUE OF LEGENDS
@@ -56,16 +74,16 @@ def health():
     return {"status": "ok", "idade_caches_horas": caches}
 
 
-def ler_cache():
+def ler_cache(fila: str = "solo"):
     if not os.path.exists(ARQUIVO_CACHE):
         raise HTTPException(status_code=503, detail="Aguarde. O cache inicial está sendo gerado pelo servidor.")
-    
+
     with open(ARQUIVO_CACHE, "r") as f:
-        return json.load(f)
+        return _slice_fila(json.load(f), fila)
 
 @app.get("/benchmarks/todos")
-def obter_todos_os_benchmarks():
-    dados_brutos = ler_cache()
+def obter_todos_os_benchmarks(fila: Optional[str] = None):
+    dados_brutos = ler_cache(_validar_fila(fila))
     dados_ordenados = {}
     
     # 1. Puxa os elos na ordem exata da nossa lista
@@ -86,12 +104,12 @@ def obter_todos_os_benchmarks():
 # ter prioridade no roteamento do FastAPI.
 # ==========================================
 
-def ler_cache_rota():
+def ler_cache_rota(fila: str = "solo"):
     if not os.path.exists(ARQUIVO_CACHE_ROTA):
         raise HTTPException(status_code=503, detail="Aguarde. O cache por rota está sendo gerado pelo servidor.")
 
     with open(ARQUIVO_CACHE_ROTA, "r") as f:
-        return json.load(f)
+        return _slice_fila(json.load(f), fila)
 
 def _validar_posicao(posicao: str) -> str:
     posicao = posicao.upper()
@@ -109,9 +127,9 @@ _METRICAS_ROTA = [
     "kpa", "solo_kills", "cs_jungle_10m", "cs_rota_10m", "pct_dano_time",
 ]
 
-def _consultar_agregados(where_extra: str, params: list) -> dict:
+def _consultar_agregados(where_extra: str, params: list, fila: str = "solo") -> dict:
     """Núcleo comum: lê o benchmark a partir da tabela PRÉ-AGREGADA estatisticas_agregadas
-    (campeao,posicao,elo,divisao,regiao -> n + somas), combinando o que o filtro pedir.
+    (campeao,posicao,elo,divisao,regiao,FILA -> n + somas), combinando o que o filtro pedir.
     AVG = SUM(soma_m)/SUM(n) — matematicamente idêntico ao AVG ao vivo, mas sobre uma
     tabela de ~100k linhas (ms) em vez de varrer os ~4M de estatisticas_meta a cada request.
     Retorna { 'ELO_DIV': {amostra, kda, ...}, ... }. Cai p/ {} se a tabela ainda não existe
@@ -125,10 +143,11 @@ def _consultar_agregados(where_extra: str, params: list) -> dict:
     query = f"""
         SELECT elo, divisao, SUM(n) AS amostra, {medias}
         FROM estatisticas_agregadas
-        WHERE {where_extra}
+        WHERE fila = ? AND {where_extra}
         GROUP BY elo, divisao
         HAVING SUM(n) >= 20
     """
+    params = [fila] + list(params)
     conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
@@ -148,15 +167,16 @@ def _consultar_agregados(where_extra: str, params: list) -> dict:
         resultado[chave] = bloco
     return resultado
 
-def _rota_bench_por_regiao(posicao: str, regiao: str) -> dict:
+def _rota_bench_por_regiao(posicao: str, regiao: str, fila: str = "solo") -> dict:
     """Benchmark de uma rota por elo+divisão para UMA região, somando TODOS os campeões
     daquela rota/região na tabela agregada. { 'ELO_DIV': {amostra, kda, ...}, ... }."""
     return _consultar_agregados(
         "UPPER(posicao) = UPPER(?) AND UPPER(regiao) = UPPER(?)",
         [posicao, regiao],
+        fila,
     )
 
-def _anexar_percentis(bench: dict, posicao: str) -> dict:
+def _anexar_percentis(bench: dict, posicao: str, fila: str = "solo") -> dict:
     """Anexa a grade de percentis (p5..p95, cache DIÁRIO do agregador) a cada bloco de
     elo, em bloco['percentis'] = {metrica: [19 valores]}. Os percentis são sempre
     GLOBAIS (sem recorte de região): o pré-agregado regional só guarda somas, e a
@@ -164,7 +184,7 @@ def _anexar_percentis(bench: dict, posicao: str) -> dict:
     if not os.path.exists(ARQUIVO_CACHE_PERCENTIS):
         return bench
     with open(ARQUIVO_CACHE_PERCENTIS, "r") as f:
-        percentis = json.load(f)
+        percentis = _slice_fila(json.load(f), fila)
     for elo, bloco in bench.items():
         grade = percentis.get(elo, {}).get(posicao)
         if grade:
@@ -172,16 +192,16 @@ def _anexar_percentis(bench: dict, posicao: str) -> dict:
             bloco["percentis_amostra"] = grade.get("amostra")
     return bench
 
-def _bench_por_elo(posicao: str, regiao: str = None) -> dict:
+def _bench_por_elo(posicao: str, regiao: str = None, fila: str = "solo") -> dict:
     """Retorna { 'ELO_DIV': {metricas} } de uma rota: por região (DB) ou global (cache)."""
     if regiao:
-        bench = _rota_bench_por_regiao(posicao, regiao)
+        bench = _rota_bench_por_regiao(posicao, regiao, fila)
     else:
-        dados = ler_cache_rota()
+        dados = ler_cache_rota(fila)
         bench = {chave: bloco[posicao] for chave, bloco in dados.items() if posicao in bloco}
-    return _anexar_percentis(bench, posicao)
+    return _anexar_percentis(bench, posicao, fila)
 
-def _bench_por_campeoes(posicao: str, campeoes: list, regiao: str = None) -> dict:
+def _bench_por_campeoes(posicao: str, campeoes: list, regiao: str = None, fila: str = "solo") -> dict:
     """Agrega o benchmark de uma rota restrito a uma LISTA de campeões (mono = 1 nome,
     pool = vários), por elo+divisão, direto do DB. Mesma forma do benchmark de rota:
     { 'ELO_DIV': {amostra, kda, ...}, ... }. O AVG sobre a lista já dá a 'média da pool'
@@ -194,7 +214,7 @@ def _bench_por_campeoes(posicao: str, campeoes: list, regiao: str = None) -> dic
     if regiao:
         where += " AND UPPER(regiao) = UPPER(?)"
         params.append(regiao)
-    return _consultar_agregados(where, params)
+    return _consultar_agregados(where, params, fila)
 
 @app.get("/benchmarks/campeoes/{posicao}")
 def obter_benchmark_campeoes(
@@ -202,16 +222,18 @@ def obter_benchmark_campeoes(
     campeoes: str = Query(..., description="Lista de campeões separada por vírgula (mono = 1)"),
     elo: Optional[str] = None,
     regiao: Optional[str] = None,
+    fila: Optional[str] = None,
 ):
     """Benchmark de uma rota restrito a um conjunto de campeões (mono ou pool do jogador).
     `?campeoes=Jinx,Caitlyn,Ashe`. Sem `?elo=`, retorna todos os elos (ordenados);
     com `?elo=`, faz média das divisões daquele elo (apex ignora divisão)."""
     posicao = _validar_posicao(posicao)
+    fila = _validar_fila(fila)
     lista = [c.strip() for c in campeoes.split(",") if c.strip()]
     if not lista:
         raise HTTPException(status_code=400, detail="Informe ao menos um campeão.")
 
-    bench = _bench_por_campeoes(posicao, lista, regiao)
+    bench = _bench_por_campeoes(posicao, lista, regiao, fila)
     if not bench:
         raise HTTPException(status_code=404, detail="Amostra insuficiente para esses campeões.")
 
@@ -235,14 +257,14 @@ def obter_benchmark_campeoes(
     return {"elo": elo, "posicao": posicao, "campeoes": lista, "benchmark": media}
 
 @app.get("/benchmarks/rota/{posicao}")
-def obter_benchmark_rota_todos(posicao: str, regiao: Optional[str] = None):
+def obter_benchmark_rota_todos(posicao: str, regiao: Optional[str] = None, fila: Optional[str] = None):
     """
     Retorna o benchmark de uma rota em TODOS os elos (ordenados hierarquicamente).
     Usado para o cálculo de elo equivalente e para avaliar os elos por rota.
     Com `?regiao=` (ex.: kr), agrega só aquela região direto do DB; sem ele, usa o cache global.
     """
     posicao = _validar_posicao(posicao)
-    bench = _bench_por_elo(posicao, regiao)
+    bench = _bench_por_elo(posicao, regiao, _validar_fila(fila))
 
     resultado = {chave: bench[chave] for chave in ORDEM_ELOS if chave in bench}
 
@@ -253,11 +275,11 @@ def obter_benchmark_rota_todos(posicao: str, regiao: Optional[str] = None):
 
 @app.get("/benchmarks/rota/{posicao}/{elo}")
 @app.get("/benchmarks/rota/{posicao}/{elo}/{divisao}")
-def obter_benchmark_rota(posicao: str, elo: str, divisao: str = None, regiao: Optional[str] = None):
+def obter_benchmark_rota(posicao: str, elo: str, divisao: str = None, regiao: Optional[str] = None, fila: Optional[str] = None):
     """Benchmark de uma rota em um elo (apex ignora divisão; só-elo faz média de I..IV).
     Com `?regiao=` agrega só aquela região; sem ele, usa o cache global."""
     posicao = _validar_posicao(posicao)
-    bench = _bench_por_elo(posicao, regiao)
+    bench = _bench_por_elo(posicao, regiao, _validar_fila(fila))
     elo = elo.upper()
 
     # Elos Apex: ignoram divisão
@@ -292,9 +314,9 @@ def obter_benchmark_rota(posicao: str, elo: str, divisao: str = None, regiao: Op
 
 @app.get("/benchmarks/{elo}")
 @app.get("/benchmarks/{elo}/{divisao}")
-def obter_benchmark(elo: str, divisao: str = None):
+def obter_benchmark(elo: str, divisao: str = None, fila: Optional[str] = None):
 
-    dados = ler_cache()
+    dados = ler_cache(_validar_fila(fila))
 
     elo = elo.upper()
 
@@ -383,8 +405,10 @@ def pesquisa_avancada(
     elo: Optional[str] = None,
     divisao: Optional[str] = None,
     regiao: Optional[str] = None,
-    vitoria: Optional[int] = None
+    vitoria: Optional[int] = None,
+    fila: Optional[str] = None
 ):
+    fila = _validar_fila(fila)
 
     if elo and elo.upper() in ['MASTER', 'GRANDMASTER', 'CHALLENGER']:
         divisao = 'I'
@@ -421,10 +445,10 @@ def pesquisa_avancada(
             AVG(cs_jungle_10m) as cs_jungle_10m,
             AVG(cs_rota_10m) as cs_rota_10m
         FROM estatisticas_meta
-        WHERE COALESCE(fila, 'solo') = 'solo'
+        WHERE COALESCE(fila, 'solo') = ?
     """
 
-    parametros = []
+    parametros = [fila]
     
     if campeao:
         query += " AND UPPER(campeao) = UPPER(?)"
@@ -520,31 +544,32 @@ def obter_mapa_de_itens() -> dict:
     return {item_id: detalhes["name"] for item_id, detalhes in dados.items()}
 
 @app.get("/panorama-meta/{elo}")
-def obter_panorama_meta(elo: str):
+def obter_panorama_meta(elo: str, fila: Optional[str] = None):
     """
-    Lê o JSON estático com os top 10 campeões e top 5 itens mais frequentes, 
-    garantindo velocidade extrema para a IA.
+    Lê o JSON estático com os top 10 campeões e top 5 itens mais frequentes,
+    garantindo velocidade extrema para a IA. `?fila=solo|flex|normal` (default solo).
     """
     elo = elo.upper()
+    fila = _validar_fila(fila)
     elos_validos = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"]
-    
+
     if elo not in elos_validos:
         raise HTTPException(status_code=400, detail="Elo inválido.")
 
     if not os.path.exists(ARQUIVO_CACHE_PANORAMA):
         raise HTTPException(
-            status_code=503, 
+            status_code=503,
             detail="O servidor está construindo o cache do panorama. Tente em alguns minutos."
         )
 
     try:
         with open(ARQUIVO_CACHE_PANORAMA, "r") as f:
-            dados_panorama = json.load(f)
-            
+            dados_panorama = _slice_fila(json.load(f), fila)
+
         if elo in dados_panorama:
             return dados_panorama[elo]
         else:
             return {"mensagem": "Dados insuficientes no banco para gerar o panorama deste Elo."}
-            
+
     except Exception as e:
          raise HTTPException(status_code=500, detail=f"Erro ao ler cache: {str(e)}")

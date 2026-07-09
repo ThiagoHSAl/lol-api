@@ -32,6 +32,11 @@ def conectar(somente_leitura=False):
 # região: o pré-agregado regional só guarda somas, e percentil exige a amostra.
 INTERVALO_PERCENTIS = 86400
 PONTOS_PERCENTIS = list(range(5, 100, 5))  # p5, p10, ..., p95
+FILAS = ["solo", "flex", "normal"]
+
+
+def _cond_fila(fila: str) -> str:
+    return "COALESCE(fila, 'solo') = 'solo'" if fila == "solo" else f"fila = '{fila}'"
 
 
 def _grade_percentis(valores_ordenados: list) -> list:
@@ -50,43 +55,45 @@ def _grade_percentis(valores_ordenados: list) -> list:
 def atualizar_cache_percentis_rota():
     """Percentis por (elo, divisão, posição). Uma query por grupo (≤ ~50k linhas de
     cada vez, via idx_elo_divisao) para caber na RAM do servidor."""
+    colunas = ", ".join(METRICAS_AGG)
     conn = conectar(somente_leitura=True)
     try:
-        grupos = conn.execute("""
-            SELECT elo, divisao, posicao, COUNT(*) AS n
-            FROM estatisticas_meta
-            WHERE elo IS NOT NULL AND divisao IS NOT NULL
-              AND posicao IS NOT NULL AND posicao <> ''
-              AND COALESCE(fila, 'solo') = 'solo'
-            GROUP BY elo, divisao, posicao
-            HAVING COUNT(*) >= 100
-        """).fetchall()
+        por_fila = {}
+        for fila in FILAS:
+            grupos = conn.execute(f"""
+                SELECT elo, divisao, posicao, COUNT(*) AS n
+                FROM estatisticas_meta
+                WHERE elo IS NOT NULL AND divisao IS NOT NULL
+                  AND posicao IS NOT NULL AND posicao <> ''
+                  AND {_cond_fila(fila)}
+                GROUP BY elo, divisao, posicao
+                HAVING COUNT(*) >= 100
+            """).fetchall()
 
-        colunas = ", ".join(METRICAS_AGG)
-        resultado = {}
-        for g in grupos:
-            linhas = conn.execute(
-                f"SELECT id, {colunas} FROM estatisticas_meta "
-                "WHERE elo = ? AND divisao = ? AND posicao = ? "
-                "AND COALESCE(fila, 'solo') = 'solo'",
-                (g["elo"], g["divisao"], g["posicao"]),
-            ).fetchall()
-            bloco = {"amostra": len(linhas)}
-            for m in METRICAS_AGG:
-                if m == "kpa":  # mesma regra do AVG: zeros bugados antigos fora (ver ID_FIX_KPA)
-                    vals = sorted(l["kpa"] for l in linhas
-                                  if l["kpa"] is not None and (l["kpa"] > 0 or l["id"] >= ID_FIX_KPA))
-                else:
-                    vals = sorted(l[m] for l in linhas if l[m] is not None)
-                if len(vals) >= 100:
-                    bloco[m] = _grade_percentis(vals)
-            elo_completo = f"{g['elo']}_{g['divisao']}".upper()
-            resultado.setdefault(elo_completo, {})[str(g["posicao"]).upper()] = bloco
+            resultado = {}
+            for g in grupos:
+                linhas = conn.execute(
+                    f"SELECT id, {colunas} FROM estatisticas_meta "
+                    f"WHERE elo = ? AND divisao = ? AND posicao = ? AND {_cond_fila(fila)}",
+                    (g["elo"], g["divisao"], g["posicao"]),
+                ).fetchall()
+                bloco = {"amostra": len(linhas)}
+                for m in METRICAS_AGG:
+                    if m == "kpa":  # mesma regra do AVG: zeros bugados antigos fora (ver ID_FIX_KPA)
+                        vals = sorted(l["kpa"] for l in linhas
+                                      if l["kpa"] is not None and (l["kpa"] > 0 or l["id"] >= ID_FIX_KPA))
+                    else:
+                        vals = sorted(l[m] for l in linhas if l[m] is not None)
+                    if len(vals) >= 100:
+                        bloco[m] = _grade_percentis(vals)
+                elo_completo = f"{g['elo']}_{g['divisao']}".upper()
+                resultado.setdefault(elo_completo, {})[str(g["posicao"]).upper()] = bloco
+            por_fila[fila] = resultado
     finally:
         conn.close()
 
     with open("cache_percentis_rota.json", "w") as f:
-        json.dump(resultado, f)
+        json.dump(por_fila, f)
     log("✅ Cache de Percentis por Rota atualizado!")
 
 

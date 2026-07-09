@@ -27,6 +27,18 @@ METRICAS_AGG = [
 ]
 
 
+# Filas suportadas. Os caches passam a ser NINHADOS por fila: {"solo":{...}, "flex":{...},
+# "normal":{...}}. 'solo' inclui os 5M de registros antigos (fila NULL, pré-migração);
+# flex/normal só existem em dados novos (crawlers desde 08/07). Ver ingest_crawler.
+FILAS = ["solo", "flex", "normal"]
+
+
+def _cond_fila(fila: str) -> str:
+    """Fragmento WHERE para restringir a agregação a UMA fila. 'solo' precisa do COALESCE
+    para incluir os registros antigos (fila NULL); flex/normal são sempre explícitos."""
+    return "COALESCE(fila, 'solo') = 'solo'" if fila == "solo" else f"fila = '{fila}'"
+
+
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -66,16 +78,18 @@ def atualizar_tabela_agregada():
     # os zeros bugados antigos. soma_kpa já está correto (zero bugado soma 0); só o divisor
     # precisava deixar de incluir o prefixo bugado. Os demais n/soma seguem sobre TODAS as
     # linhas (o bug era exclusivo do kpa).
+    # Agora com a dimensão FILA (COALESCE p/ os antigos NULL virarem 'solo'): a mesma tabela
+    # serve as 3 filas de uma vez, e os endpoints filtram por fila.
     select_agg = f"""
-        SELECT campeao, posicao, elo, divisao, regiao, COUNT(*) AS n,
+        SELECT campeao, posicao, elo, divisao, regiao, COALESCE(fila, 'solo') AS fila,
+               COUNT(*) AS n,
                SUM(CASE WHEN kpa > 0 OR id >= {ID_FIX_KPA} THEN 1 ELSE 0 END) AS n_kpa,
                {somas}
         FROM estatisticas_meta
         WHERE elo IS NOT NULL AND divisao IS NOT NULL
           AND posicao IS NOT NULL AND posicao <> ''
           AND regiao IS NOT NULL AND campeao IS NOT NULL
-          AND COALESCE(fila, 'solo') = 'solo'
-        GROUP BY campeao, posicao, elo, divisao, regiao
+        GROUP BY campeao, posicao, elo, divisao, regiao, COALESCE(fila, 'solo')
     """
 
     # FASE LEITURA — pesada, mas sem write-lock (não trava crawlers).
@@ -85,8 +99,8 @@ def atualizar_tabela_agregada():
     finally:
         ro.close()
 
-    cols = ["campeao", "posicao", "elo", "divisao", "regiao", "n", "n_kpa"] + [f"soma_{m}" for m in METRICAS_AGG]
-    coldefs = ("campeao TEXT, posicao TEXT, elo TEXT, divisao TEXT, regiao TEXT, n INTEGER, n_kpa INTEGER, "
+    cols = ["campeao", "posicao", "elo", "divisao", "regiao", "fila", "n", "n_kpa"] + [f"soma_{m}" for m in METRICAS_AGG]
+    coldefs = ("campeao TEXT, posicao TEXT, elo TEXT, divisao TEXT, regiao TEXT, fila TEXT, n INTEGER, n_kpa INTEGER, "
                + ", ".join(f"soma_{m} REAL" for m in METRICAS_AGG))
     placeholders = ", ".join("?" * len(cols))
     dados = [tuple(linha) for linha in linhas]
@@ -101,10 +115,11 @@ def atualizar_tabela_agregada():
             f"INSERT INTO estatisticas_agregadas ({', '.join(cols)}) VALUES ({placeholders})",
             dados,
         )
+        # Índices incluem `fila` como 1ª coluna: os endpoints sempre filtram por ela.
         rw.execute("""CREATE INDEX idx_agg_pos_reg
-                      ON estatisticas_agregadas(UPPER(posicao), UPPER(regiao), elo, divisao)""")
+                      ON estatisticas_agregadas(fila, UPPER(posicao), UPPER(regiao), elo, divisao)""")
         rw.execute("""CREATE INDEX idx_agg_camp_pos_reg
-                      ON estatisticas_agregadas(UPPER(campeao), UPPER(posicao), UPPER(regiao), elo, divisao)""")
+                      ON estatisticas_agregadas(fila, UPPER(campeao), UPPER(posicao), UPPER(regiao), elo, divisao)""")
         rw.execute("COMMIT")
         # Mantém o WAL pequeno: trunca o que for possível (não bloqueia se houver leitor ativo).
         rw.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -190,33 +205,34 @@ def obter_mapa_botas() -> dict:
 # 2) BENCHMARKS BASE (somente leitura)
 # ---------------------------------------------------------------------------
 def atualizar_cache_benchmarks():
-    """Agregação de métricas base por elo+divisão."""
+    """Agregação de métricas base por elo+divisão, NINHADA por fila."""
     conn = conectar(somente_leitura=True)
     try:
-        query = """
-            SELECT elo || '_' || divisao AS elo_completo,
-                   AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min, AVG(visao_min) AS visao_min
-            FROM estatisticas_meta
-            WHERE elo IS NOT NULL AND divisao IS NOT NULL
-              AND COALESCE(fila, 'solo') = 'solo'
-            GROUP BY elo, divisao
-        """
-        linhas = conn.execute(query).fetchall()
+        por_fila = {}
+        for fila in FILAS:
+            query = f"""
+                SELECT elo || '_' || divisao AS elo_completo,
+                       AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min, AVG(visao_min) AS visao_min
+                FROM estatisticas_meta
+                WHERE elo IS NOT NULL AND divisao IS NOT NULL
+                  AND {_cond_fila(fila)}
+                GROUP BY elo, divisao
+            """
+            resultado_json = {}
+            for linha in conn.execute(query).fetchall():
+                elo_completo = str(linha["elo_completo"]).upper()
+                resultado_json[elo_completo] = {
+                    "kda": round(linha["kda"], 2) if linha["kda"] else 0.0,
+                    "cs_min": round(linha["cs_min"], 2) if linha["cs_min"] else 0.0,
+                    "ouro_min": round(linha["ouro_min"], 2) if linha["ouro_min"] else 0.0,
+                    "visao_min": round(linha["visao_min"], 2) if linha["visao_min"] else 0.0,
+                }
+            por_fila[fila] = resultado_json
     finally:
         conn.close()
 
-    resultado_json = {}
-    for linha in linhas:
-        elo_completo = str(linha["elo_completo"]).upper()
-        resultado_json[elo_completo] = {
-            "kda": round(linha["kda"], 2) if linha["kda"] else 0.0,
-            "cs_min": round(linha["cs_min"], 2) if linha["cs_min"] else 0.0,
-            "ouro_min": round(linha["ouro_min"], 2) if linha["ouro_min"] else 0.0,
-            "visao_min": round(linha["visao_min"], 2) if linha["visao_min"] else 0.0,
-        }
-
     with open("cache_benchmarks.json", "w") as f:
-        json.dump(resultado_json, f, indent=4)
+        json.dump(por_fila, f, indent=4)
     log("✅ Cache de Benchmarks Base atualizado!")
 
 
@@ -225,47 +241,46 @@ def atualizar_cache_benchmarks():
 # ---------------------------------------------------------------------------
 def atualizar_cache_benchmarks_rota():
     """Agrega benchmarks por elo + divisao + POSICAO, com todas as métricas relevantes a cada rota."""
-    conn = conectar(somente_leitura=True)
-    try:
-        query = f"""
-            SELECT elo, divisao, posicao, COUNT(*) AS amostra,
-                   AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min,
-                   AVG(visao_min) AS visao_min, AVG(dano_min) AS dano_min,
-                   AVG(dano_objetivos) AS dano_objetivos, AVG(dano_torres) AS dano_torres,
-                   AVG(tempo_cc) AS tempo_cc, AVG(pink_wards) AS pink_wards,
-                   AVG(cura_total) AS cura_total, AVG(dano_mitigado) AS dano_mitigado,
-                   AVG(CASE WHEN kpa > 0 OR id >= {ID_FIX_KPA} THEN kpa END) AS kpa, AVG(solo_kills) AS solo_kills,
-                   AVG(cs_jungle_10m) AS cs_jungle_10m, AVG(cs_rota_10m) AS cs_rota_10m,
-                   AVG(pct_dano_time) AS pct_dano_time
-            FROM estatisticas_meta
-            WHERE elo IS NOT NULL AND divisao IS NOT NULL
-              AND posicao IS NOT NULL AND posicao <> ''
-              AND COALESCE(fila, 'solo') = 'solo'
-            GROUP BY elo, divisao, posicao
-            HAVING COUNT(*) >= 20
-        """
-        linhas = conn.execute(query).fetchall()
-    finally:
-        conn.close()
-
     metricas = [
         "kda", "cs_min", "ouro_min", "visao_min", "dano_min", "dano_objetivos",
         "dano_torres", "tempo_cc", "pink_wards", "cura_total", "dano_mitigado",
         "kpa", "solo_kills", "cs_jungle_10m", "cs_rota_10m", "pct_dano_time",
     ]
+    conn = conectar(somente_leitura=True)
+    try:
+        por_fila = {}
+        for fila in FILAS:
+            query = f"""
+                SELECT elo, divisao, posicao, COUNT(*) AS amostra,
+                       AVG(kda) AS kda, AVG(cs_min) AS cs_min, AVG(ouro_min) AS ouro_min,
+                       AVG(visao_min) AS visao_min, AVG(dano_min) AS dano_min,
+                       AVG(dano_objetivos) AS dano_objetivos, AVG(dano_torres) AS dano_torres,
+                       AVG(tempo_cc) AS tempo_cc, AVG(pink_wards) AS pink_wards,
+                       AVG(cura_total) AS cura_total, AVG(dano_mitigado) AS dano_mitigado,
+                       AVG(CASE WHEN kpa > 0 OR id >= {ID_FIX_KPA} THEN kpa END) AS kpa, AVG(solo_kills) AS solo_kills,
+                       AVG(cs_jungle_10m) AS cs_jungle_10m, AVG(cs_rota_10m) AS cs_rota_10m,
+                       AVG(pct_dano_time) AS pct_dano_time
+                FROM estatisticas_meta
+                WHERE elo IS NOT NULL AND divisao IS NOT NULL
+                  AND posicao IS NOT NULL AND posicao <> ''
+                  AND {_cond_fila(fila)}
+                GROUP BY elo, divisao, posicao
+                HAVING COUNT(*) >= 20
+            """
+            resultado_json = {}
+            for linha in conn.execute(query).fetchall():
+                elo_completo = f"{linha['elo']}_{linha['divisao']}".upper()
+                posicao = str(linha["posicao"]).upper()
+                bloco = {"amostra": linha["amostra"]}
+                for m in metricas:
+                    valor = linha[m]
+                    bloco[m] = round(valor, 4) if valor is not None else 0.0
+                resultado_json.setdefault(elo_completo, {})[posicao] = bloco
+            por_fila[fila] = resultado_json
+    finally:
+        conn.close()
 
-    resultado_json = {}
-    for linha in linhas:
-        elo_completo = f"{linha['elo']}_{linha['divisao']}".upper()
-        posicao = str(linha["posicao"]).upper()
-
-        bloco = {"amostra": linha["amostra"]}
-        for m in metricas:
-            valor = linha[m]
-            bloco[m] = round(valor, 4) if valor is not None else 0.0
-
-        resultado_json.setdefault(elo_completo, {})[posicao] = bloco
-
+    resultado_json = por_fila
     with open("cache_benchmarks_rota.json", "w") as f:
         json.dump(resultado_json, f, indent=4)
     log("✅ Cache de Benchmarks por Rota atualizado!")
@@ -300,43 +315,45 @@ def _grade_percentis(valores_ordenados: list) -> list:
 def atualizar_cache_percentis_rota():
     """Percentis por (elo, divisão, posição). Uma query por grupo (≤ ~50k linhas de
     cada vez, via idx_elo_divisao) para caber na RAM do servidor."""
+    colunas = ", ".join(METRICAS_AGG)
     conn = conectar(somente_leitura=True)
     try:
-        grupos = conn.execute("""
-            SELECT elo, divisao, posicao, COUNT(*) AS n
-            FROM estatisticas_meta
-            WHERE elo IS NOT NULL AND divisao IS NOT NULL
-              AND posicao IS NOT NULL AND posicao <> ''
-              AND COALESCE(fila, 'solo') = 'solo'
-            GROUP BY elo, divisao, posicao
-            HAVING COUNT(*) >= 100
-        """).fetchall()
+        por_fila = {}
+        for fila in FILAS:
+            grupos = conn.execute(f"""
+                SELECT elo, divisao, posicao, COUNT(*) AS n
+                FROM estatisticas_meta
+                WHERE elo IS NOT NULL AND divisao IS NOT NULL
+                  AND posicao IS NOT NULL AND posicao <> ''
+                  AND {_cond_fila(fila)}
+                GROUP BY elo, divisao, posicao
+                HAVING COUNT(*) >= 100
+            """).fetchall()
 
-        colunas = ", ".join(METRICAS_AGG)
-        resultado = {}
-        for g in grupos:
-            linhas = conn.execute(
-                f"SELECT id, {colunas} FROM estatisticas_meta "
-                "WHERE elo = ? AND divisao = ? AND posicao = ? "
-                "AND COALESCE(fila, 'solo') = 'solo'",
-                (g["elo"], g["divisao"], g["posicao"]),
-            ).fetchall()
-            bloco = {"amostra": len(linhas)}
-            for m in METRICAS_AGG:
-                if m == "kpa":  # mesma regra do AVG: zeros bugados antigos fora (ver ID_FIX_KPA)
-                    vals = sorted(l["kpa"] for l in linhas
-                                  if l["kpa"] is not None and (l["kpa"] > 0 or l["id"] >= ID_FIX_KPA))
-                else:
-                    vals = sorted(l[m] for l in linhas if l[m] is not None)
-                if len(vals) >= 100:
-                    bloco[m] = _grade_percentis(vals)
-            elo_completo = f"{g['elo']}_{g['divisao']}".upper()
-            resultado.setdefault(elo_completo, {})[str(g["posicao"]).upper()] = bloco
+            resultado = {}
+            for g in grupos:
+                linhas = conn.execute(
+                    f"SELECT id, {colunas} FROM estatisticas_meta "
+                    f"WHERE elo = ? AND divisao = ? AND posicao = ? AND {_cond_fila(fila)}",
+                    (g["elo"], g["divisao"], g["posicao"]),
+                ).fetchall()
+                bloco = {"amostra": len(linhas)}
+                for m in METRICAS_AGG:
+                    if m == "kpa":  # mesma regra do AVG: zeros bugados antigos fora (ver ID_FIX_KPA)
+                        vals = sorted(l["kpa"] for l in linhas
+                                      if l["kpa"] is not None and (l["kpa"] > 0 or l["id"] >= ID_FIX_KPA))
+                    else:
+                        vals = sorted(l[m] for l in linhas if l[m] is not None)
+                    if len(vals) >= 100:
+                        bloco[m] = _grade_percentis(vals)
+                elo_completo = f"{g['elo']}_{g['divisao']}".upper()
+                resultado.setdefault(elo_completo, {})[str(g["posicao"]).upper()] = bloco
+            por_fila[fila] = resultado
     finally:
         conn.close()
 
     with open("cache_percentis_rota.json", "w") as f:
-        json.dump(resultado, f)
+        json.dump(por_fila, f)
     log("✅ Cache de Percentis por Rota atualizado!")
 
 
@@ -361,91 +378,94 @@ def atualizar_cache_panorama():
     posicoes = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 
     conn = conectar(somente_leitura=True)
+
+    def _top10_da_fila(fila, elo, posicao):
+        """Top-10 campeões (por Wilson LB) + build de UMA fila/elo/posição."""
+        campeoes_db = conn.execute(
+            f"""
+            SELECT campeao, COUNT(*) AS total_partidas,
+                   SUM(vitoria) * 100.0 / COUNT(*) AS winrate,
+                   ( ( (SUM(vitoria)*1.0/COUNT(*)) + 5.4289/(2*COUNT(*))
+                       - 2.33*sqrt( ((SUM(vitoria)*1.0/COUNT(*))*(1-(SUM(vitoria)*1.0/COUNT(*)))
+                                    + 5.4289/(4*COUNT(*)))/COUNT(*) ) )
+                     / (1 + 5.4289/COUNT(*)) ) AS wilson_lb
+            FROM estatisticas_meta
+            WHERE elo = ? AND posicao = ? AND {_cond_fila(fila)}
+            GROUP BY campeao
+            HAVING total_partidas >= 100
+            ORDER BY wilson_lb DESC
+            LIMIT 10
+            """,
+            (elo, posicao),
+        ).fetchall()
+
+        top_campeoes = [r["campeao"] for r in campeoes_db]
+        contadores = {c: Counter() for c in top_campeoes}
+        contadores_botas = {c: Counter() for c in top_campeoes}
+
+        if top_campeoes:
+            placeholders = ", ".join("?" * len(top_campeoes))
+            cursor_itens = conn.execute(
+                f"""
+                SELECT campeao, itens, botas_compradas FROM estatisticas_meta
+                WHERE elo = ? AND posicao = ? AND campeao IN ({placeholders})
+                  AND {_cond_fila(fila)}
+                """,
+                (elo, posicao, *top_campeoes),
+            )
+            for linha in cursor_itens:
+                contador = contadores[linha["campeao"]]
+                contador_botas = contadores_botas[linha["campeao"]]
+
+                # TOP-5 ITENS: sempre do inventário final (itens de build completa
+                # não sofrem do problema da bota vendida no late).
+                itens_str = linha["itens"]
+                itens_ids = []
+                if itens_str:
+                    itens_ids = json.loads(itens_str) if "[" in itens_str else itens_str.split(",")
+                    itens_ids = [str(i).strip() for i in itens_ids]
+                    for item_id in itens_ids:
+                        if item_id in mapa_itens_finais:
+                            contador[item_id] += 1
+
+                # TOP-2 BOTAS com FALLBACK: prefere as botas COMPRADAS (timeline, sem
+                # viés); nas linhas antigas (sem timeline) cai para o inventário final.
+                # mapa_botas só tem tier-2 (>500g), então a Bota básica 1001 é ignorada.
+                botas_str = linha["botas_compradas"]
+                botas_ids = ([b.strip() for b in botas_str.split(",")]
+                             if botas_str else itens_ids)
+                for item_id in botas_ids:
+                    if item_id in mapa_botas:
+                        contador_botas[item_id] += 1
+
+        top_10 = []
+        for champ_row in campeoes_db:
+            campeao = champ_row["campeao"]
+            top_5_ids = [item_id for item_id, _ in contadores[campeao].most_common(5)]
+            top_5_nomes = [mapa_itens_finais[i] for i in top_5_ids]
+            top_2_botas = [mapa_botas[i] for i, _ in
+                           contadores_botas[campeao].most_common(2)]
+            top_10.append({
+                "campeao": campeao,
+                "winrate": round(champ_row["winrate"], 2),
+                "amostra": champ_row["total_partidas"],
+                "top_5_itens": top_5_nomes,
+                "top_2_botas": top_2_botas,
+            })
+        return top_10
+
     try:
-        panorama_global = {}
-        for elo in elos:
-            panorama_elo = {}
-            for posicao in posicoes:
-                campeoes_db = conn.execute(
-                    """
-                    SELECT campeao, COUNT(*) AS total_partidas,
-                           SUM(vitoria) * 100.0 / COUNT(*) AS winrate,
-                           ( ( (SUM(vitoria)*1.0/COUNT(*)) + 5.4289/(2*COUNT(*))
-                               - 2.33*sqrt( ((SUM(vitoria)*1.0/COUNT(*))*(1-(SUM(vitoria)*1.0/COUNT(*)))
-                                            + 5.4289/(4*COUNT(*)))/COUNT(*) ) )
-                             / (1 + 5.4289/COUNT(*)) ) AS wilson_lb
-                    FROM estatisticas_meta
-                    WHERE elo = ? AND posicao = ?
-                      AND COALESCE(fila, 'solo') = 'solo'
-                    GROUP BY campeao
-                    HAVING total_partidas >= 100
-                    ORDER BY wilson_lb DESC
-                    LIMIT 10
-                    """,
-                    (elo, posicao),
-                ).fetchall()
-
-                top_campeoes = [r["campeao"] for r in campeoes_db]
-                contadores = {c: Counter() for c in top_campeoes}
-                contadores_botas = {c: Counter() for c in top_campeoes}
-
-                if top_campeoes:
-                    placeholders = ", ".join("?" * len(top_campeoes))
-                    cursor_itens = conn.execute(
-                        f"""
-                        SELECT campeao, itens, botas_compradas FROM estatisticas_meta
-                        WHERE elo = ? AND posicao = ? AND campeao IN ({placeholders})
-                          AND COALESCE(fila, 'solo') = 'solo'
-                        """,
-                        (elo, posicao, *top_campeoes),
-                    )
-                    for linha in cursor_itens:
-                        contador = contadores[linha["campeao"]]
-                        contador_botas = contadores_botas[linha["campeao"]]
-
-                        # TOP-5 ITENS: sempre do inventário final (itens de build completa
-                        # não sofrem do problema da bota vendida no late).
-                        itens_str = linha["itens"]
-                        itens_ids = []
-                        if itens_str:
-                            itens_ids = json.loads(itens_str) if "[" in itens_str else itens_str.split(",")
-                            itens_ids = [str(i).strip() for i in itens_ids]
-                            for item_id in itens_ids:
-                                if item_id in mapa_itens_finais:
-                                    contador[item_id] += 1
-
-                        # TOP-2 BOTAS com FALLBACK: prefere as botas COMPRADAS (timeline, sem
-                        # viés); nas linhas antigas (sem timeline) cai para o inventário final.
-                        # mapa_botas só tem tier-2 (>500g), então a Bota básica 1001 é ignorada.
-                        botas_str = linha["botas_compradas"]
-                        botas_ids = ([b.strip() for b in botas_str.split(",")]
-                                     if botas_str else itens_ids)
-                        for item_id in botas_ids:
-                            if item_id in mapa_botas:
-                                contador_botas[item_id] += 1
-
-                top_10 = []
-                for champ_row in campeoes_db:
-                    campeao = champ_row["campeao"]
-                    top_5_ids = [item_id for item_id, _ in contadores[campeao].most_common(5)]
-                    top_5_nomes = [mapa_itens_finais[i] for i in top_5_ids]
-                    top_2_botas = [mapa_botas[i] for i, _ in
-                                   contadores_botas[campeao].most_common(2)]
-                    top_10.append({
-                        "campeao": campeao,
-                        "winrate": round(champ_row["winrate"], 2),
-                        "amostra": champ_row["total_partidas"],
-                        "top_5_itens": top_5_nomes,
-                        "top_2_botas": top_2_botas,
-                    })
-
-                panorama_elo[posicao] = top_10
-            panorama_global[elo] = panorama_elo
+        por_fila = {}
+        for fila in FILAS:
+            panorama_global = {}
+            for elo in elos:
+                panorama_global[elo] = {pos: _top10_da_fila(fila, elo, pos) for pos in posicoes}
+            por_fila[fila] = panorama_global
     finally:
         conn.close()
 
     with open("cache_panorama.json", "w") as f:
-        json.dump(panorama_global, f, indent=4)
+        json.dump(por_fila, f, indent=4)
     log("✅ Cache do Panorama Meta atualizado!")
 
 
