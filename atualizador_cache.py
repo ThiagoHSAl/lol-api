@@ -393,25 +393,36 @@ def atualizar_cache_panorama():
                     placeholders = ", ".join("?" * len(top_campeoes))
                     cursor_itens = conn.execute(
                         f"""
-                        SELECT campeao, itens FROM estatisticas_meta
+                        SELECT campeao, itens, botas_compradas FROM estatisticas_meta
                         WHERE elo = ? AND posicao = ? AND campeao IN ({placeholders})
                           AND COALESCE(fila, 'solo') = 'solo'
                         """,
                         (elo, posicao, *top_campeoes),
                     )
                     for linha in cursor_itens:
-                        itens_str = linha["itens"]
-                        if not itens_str:
-                            continue
-                        lista_ids = json.loads(itens_str) if "[" in itens_str else itens_str.split(",")
                         contador = contadores[linha["campeao"]]
                         contador_botas = contadores_botas[linha["campeao"]]
-                        for item_id in lista_ids:
-                            item_id = str(item_id).strip()
+
+                        # TOP-5 ITENS: sempre do inventário final (itens de build completa
+                        # não sofrem do problema da bota vendida no late).
+                        itens_str = linha["itens"]
+                        itens_ids = []
+                        if itens_str:
+                            itens_ids = json.loads(itens_str) if "[" in itens_str else itens_str.split(",")
+                            itens_ids = [str(i).strip() for i in itens_ids]
+                            for item_id in itens_ids:
+                                if item_id in mapa_itens_finais:
+                                    contador[item_id] += 1
+
+                        # TOP-2 BOTAS com FALLBACK: prefere as botas COMPRADAS (timeline, sem
+                        # viés); nas linhas antigas (sem timeline) cai para o inventário final.
+                        # mapa_botas só tem tier-2 (>500g), então a Bota básica 1001 é ignorada.
+                        botas_str = linha["botas_compradas"]
+                        botas_ids = ([b.strip() for b in botas_str.split(",")]
+                                     if botas_str else itens_ids)
+                        for item_id in botas_ids:
                             if item_id in mapa_botas:
                                 contador_botas[item_id] += 1
-                            elif item_id in mapa_itens_finais:
-                                contador[item_id] += 1
 
                 top_10 = []
                 for champ_row in campeoes_db:
