@@ -1,7 +1,7 @@
 """
 ingest_crawler.py — Ingestão de participantes no DB de benchmarks com a ROTA inferida.
 
-Fonte ÚNICA de verdade usada por crawler.py, crawlerHighElo.py e corrigir_posicoes.py.
+Fonte ÚNICA de verdade usada por crawler.py e crawlerHighElo.py.
 Em vez de gravar o `teamPosition` cru, cruza os sinais da match-v5 (ver deteccao_rota.py) e:
   - grava a ROTA inferida em `posicao` (final);
   - PULA o participante quando a rota não é confiável (descartado);

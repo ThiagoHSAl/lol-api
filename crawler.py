@@ -29,7 +29,12 @@ PACER = RiotPacer(
 
 # Filas coletadas e o queueId da Riot correspondente. A rota/benchmark do app usa só
 # 'solo'; flex e normal entram no mesmo DB separados pela coluna `fila`.
-FILAS = {"solo": 420, "flex": 440, "normal": 400}
+# Quais filas coletar é configurável por CRAWLER_FILAS no .env (csv). Default = as 3.
+# Ex.: CRAWLER_FILAS=flex,normal foca a coleta nas filas rala (solo já tem 5M linhas).
+_QUEUE_POR_FILA = {"solo": 420, "flex": 440, "normal": 400}
+FILAS = {f: _QUEUE_POR_FILA[f] for f in
+         os.getenv("CRAWLER_FILAS", "solo,flex,normal").split(",")
+         if f.strip() in _QUEUE_POR_FILA}
 
 if not RIOT_API_KEY:
     print("❌ Erro FATAL: RIOT_API_KEY não encontrada no .env inicial.")

@@ -121,8 +121,10 @@ def atualizar_tabela_agregada():
         rw.execute("""CREATE INDEX idx_agg_camp_pos_reg
                       ON estatisticas_agregadas(fila, UPPER(campeao), UPPER(posicao), UPPER(regiao), elo, divisao)""")
         rw.execute("COMMIT")
-        # Mantém o WAL pequeno: trunca o que for possível (não bloqueia se houver leitor ativo).
-        rw.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # PASSIVE (não TRUNCATE): TRUNCATE exige lock exclusivo e retorna SQLITE_BUSY aos
+        # crawlers ESCRITORES mesmo com busy_timeout — crashava os crawlers a cada rebuild.
+        # PASSIVE checkpoint o que dá sem bloquear ninguém; o WAL encolhe nos ciclos ociosos.
+        rw.execute("PRAGMA wal_checkpoint(PASSIVE)")
     except Exception:
         rw.execute("ROLLBACK")
         raise
@@ -490,6 +492,10 @@ def iniciar_agregacao():
         c = conectar()
         c.execute("PRAGMA busy_timeout=120000")
         c.execute("CREATE INDEX IF NOT EXISTS idx_elo_pos_camp ON estatisticas_meta(elo, posicao, campeao)")
+        # idx_fila: sem ele, as queries por fila (flex/normal) varrem os 5M de linhas em vez
+        # de achar as ~poucas por índice — cada tarefa de cache fazia 3 full scans. Ver
+        # [[seletor-fila-solo-flex-normal]]. Build ~4min no disco lento da VPS (idempotente).
+        c.execute("CREATE INDEX IF NOT EXISTS idx_fila ON estatisticas_meta(fila)")
         c.close()
     except Exception as e:
         log(f"⚠️ Não foi possível garantir idx_elo_pos_camp: {e}")
