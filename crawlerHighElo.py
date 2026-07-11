@@ -112,11 +112,32 @@ def chamada_api(url):
                 load_dotenv(override=True)
                 novo_raw = os.getenv(KEY_NAME)
                 novo = novo_raw.replace('"', '').replace("'", "").strip() if novo_raw else None
-                if novo and novo != atual:
-                    RIOT_API_KEY = novo
-                    print("🔄 Nova chave detectada! Retomando coleta...")
-                    break
-                print("⏳ Ainda sem chave nova; verifico de novo em 60s...")
+                if not (novo and novo != atual):
+                    print("⏳ Ainda sem chave nova; verifico de novo em 60s...")
+                    continue
+                RIOT_API_KEY = novo
+                # Chaves dev da Riot levam alguns segundos p/ propagar: uma nova
+                # pode dar 401 logo após ser gerada. Revalidamos a MESMA chave
+                # algumas vezes antes de desistir — senão descartaríamos uma chave
+                # boa e ficaríamos presos esperando outra que nunca vem.
+                print("🔄 Nova chave detectada! Revalidando (propagação)...")
+                for tentativa in range(1, 7):  # ~90s de margem
+                    time.sleep(15)
+                    try:
+                        teste = requests.get(url, headers={"X-Riot-Token": RIOT_API_KEY}, timeout=15).status_code
+                    except Exception:
+                        continue
+                    if teste not in (401, 403):
+                        print("✅ Chave validada! Retomando coleta...")
+                        break
+                    print(f"   ⏳ Chave ainda propagando ({teste}); tentativa {tentativa}/6...")
+                else:
+                    # Não validou em ~90s: trata como ruim e volta a esperar outra
+                    # (atual = novo evita reprocessar o mesmo valor em loop).
+                    atual = novo
+                    print("⚠️ Chave colada não validou; aguardando outra no .env...")
+                    continue
+                break
             continue
 
         if sc == 429:
