@@ -38,6 +38,9 @@ def _slice_fila(cache: dict, fila: str) -> dict:
 # ORDEM HIERÁRQUICA DO LEAGUE OF LEGENDS
 # ==========================================
 ORDEM_ELOS = [
+    # UNRANKED (sem divisão, como os elos apex) só existe na fila 'normal'; nas demais
+    # filas a chave nunca aparece no cache, então fica de fora naturalmente.
+    "UNRANKED_I",
     "IRON_IV", "IRON_III", "IRON_II", "IRON_I",
     "BRONZE_IV", "BRONZE_III", "BRONZE_II", "BRONZE_I",
     "SILVER_IV", "SILVER_III", "SILVER_II", "SILVER_I",
@@ -241,7 +244,7 @@ def obter_benchmark_campeoes(
         return {chave: bench[chave] for chave in ORDEM_ELOS if chave in bench}
 
     elo = elo.upper()
-    if elo in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
+    if elo in ["MASTER", "GRANDMASTER", "CHALLENGER", "UNRANKED"]:
         bloco = bench.get(f"{elo}_I")
         if bloco:
             return {"elo": elo, "posicao": posicao, "campeoes": lista, "benchmark": bloco}
@@ -283,7 +286,7 @@ def obter_benchmark_rota(posicao: str, elo: str, divisao: str = None, regiao: Op
     elo = elo.upper()
 
     # Elos Apex: ignoram divisão
-    if elo in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
+    if elo in ["MASTER", "GRANDMASTER", "CHALLENGER", "UNRANKED"]:
         bloco = bench.get(f"{elo}_I")
         if bloco:
             return {"elo": elo, "posicao": posicao, "benchmark": bloco}
@@ -321,7 +324,7 @@ def obter_benchmark(elo: str, divisao: str = None, fila: Optional[str] = None):
     elo = elo.upper()
 
     # Elos Apex: ignoram divisão
-    if elo in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
+    if elo in ["MASTER", "GRANDMASTER", "CHALLENGER", "UNRANKED"]:
 
         chave = f"{elo}_I"
 

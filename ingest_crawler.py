@@ -139,10 +139,18 @@ def linha_participante(p: dict, m_id, servidor, elo, div, posicao, apoio, duraca
 
 
 def inserir_partida(cursor, data: dict, m_id, servidor, elo, div,
-                    fila: str = "solo", timeline: dict = None) -> tuple[int, int]:
+                    fila: str = "solo", timeline: dict = None,
+                    elo_por_puuid: dict = None) -> tuple[int, int]:
     """Insere os participantes de UMA partida com a rota inferida.
     `fila` é 'solo' | 'flex' | 'normal'; `timeline` (opcional) é a Match-V5 timeline,
     de onde extraímos as botas realmente compradas por participante.
+
+    `elo_por_puuid` (normal/flex): mapa {puuid: (elo, div)} com o elo REAL de cada
+    jogador (ver ranks.py). Quando fornecido, cada participante é rotulado com o
+    SEU elo — não o do semente. Um puuid AUSENTE do mapa é descartado (na flex,
+    quem não tem rank flex fica de fora). Quando None (solo/apex), todos levam o
+    `elo,div` do semente (comportamento original).
+
     Retorna (inseridos, descartados). NÃO faz commit nem marca partidas_processadas —
     quem chama controla isso (mantém o fluxo atual do crawler)."""
     info = data["info"]
@@ -151,6 +159,16 @@ def inserir_partida(cursor, data: dict, m_id, servidor, elo, div,
     botas_map = _botas_por_participante(timeline) if timeline else {}
     inseridos = descartados = 0
     for p in info["participants"]:
+        # Elo por jogador (normal/flex) ou rótulo do semente (solo/apex).
+        if elo_por_puuid is not None:
+            rank = elo_por_puuid.get(p.get("puuid"))
+            if rank is None:
+                descartados += 1
+                continue  # sem elo na fila (ex.: unranked na flex) → fora do dataset
+            elo_p, div_p = rank
+        else:
+            elo_p, div_p = elo, div
+
         inf = rotas.get(p.get("puuid"), {})
         if not inf.get("confiavel"):
             descartados += 1
@@ -159,7 +177,7 @@ def inserir_partida(cursor, data: dict, m_id, servidor, elo, div,
         botas_str = ",".join(botas_ids) if botas_ids else None
         cursor.execute(
             _SQL_INSERT,
-            linha_participante(p, m_id, servidor, elo, div, inf["rota"], inf.get("apoio"),
+            linha_participante(p, m_id, servidor, elo_p, div_p, inf["rota"], inf.get("apoio"),
                                duracao_min, fila, botas_str),
         )
         inseridos += 1

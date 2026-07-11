@@ -376,7 +376,9 @@ def atualizar_cache_panorama():
     # Botas têm ranking PRÓPRIO ('top_2_botas') e saem do top-5 de itens — sem isso
     # elas competiam pelos 5 slots e o card não tinha a informação de bota separada.
     mapa_botas = obter_mapa_botas()
-    elos = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"]
+    # UNRANKED só tem linhas na fila 'normal' (jogadores sem rank solo); nas outras
+    # filas o SELECT por elo='UNRANKED' volta vazio e o bucket some sozinho.
+    elos = ["UNRANKED", "IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"]
     posicoes = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 
     conn = conectar(somente_leitura=True)

@@ -6,6 +6,7 @@ import random
 from dotenv import load_dotenv
 from ingest_crawler import garantir_colunas, inserir_partida  # rota inferida + sinais crus
 from riot_pacer import RiotPacer
+from ranks import RankCache, construir_mapa_ranks  # elo por jogador na normal/flex
 
 # ==========================================
 # 1. CARREGAMENTO INICIAL DA CHAVE
@@ -55,7 +56,18 @@ ELOS_APEX = {
 }
 
 # ⚠️ VOLUME ALTO: Como o objetivo é equalizar o dataset, vamos puxar mais partidas por ciclo
-META_PARTIDAS_POR_ELO = 200 
+META_PARTIDAS_POR_ELO = 200
+
+# Meta MENOR em normal/flex: cada partida dessas filas custa ~10 lookups de rank
+# (league-v4/by-puuid) além de match+timeline. Configurável por META_FLEX / META_NORMAL.
+META_POR_FILA = {
+    "solo": META_PARTIDAS_POR_ELO,
+    "flex": int(os.getenv("META_FLEX", "100")),
+    "normal": int(os.getenv("META_NORMAL", "100")),
+}
+
+# Cache PERSISTENTE de rank por jogador (arquivo próprio da dev key 2).
+RANKS = RankCache(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ranks_dev2.json"))
 
 # ==========================================
 # 3. CONEXÃO COM O BANCO DE DADOS GLOBAL
@@ -181,11 +193,12 @@ def iniciar_crawler_apex():
                     random.shuffle(jogadores)
 
                     for fila, queue_id in FILAS.items():
-                        print(f"\n🌟 [{servidor.upper()}] {elo} | fila={fila} (Meta: {META_PARTIDAS_POR_ELO})")
+                        meta_fila = META_POR_FILA.get(fila, META_PARTIDAS_POR_ELO)
+                        print(f"\n🌟 [{servidor.upper()}] {elo} | fila={fila} (Meta: {meta_fila})")
                         partidas_coletadas = 0
 
                         for j in jogadores:
-                            if partidas_coletadas >= META_PARTIDAS_POR_ELO: break
+                            if partidas_coletadas >= meta_fila: break
 
                             puuid = j.get('puuid')
                             if not puuid: continue
@@ -194,7 +207,7 @@ def iniciar_crawler_apex():
                             if not match_ids: continue
 
                             for m_id in match_ids:
-                                if partidas_coletadas >= META_PARTIDAS_POR_ELO: break
+                                if partidas_coletadas >= meta_fila: break
 
                                 if cursor.execute("SELECT 1 FROM partidas_processadas WHERE match_id = ?", (m_id,)).fetchone(): continue
 
@@ -204,13 +217,18 @@ def iniciar_crawler_apex():
                                 # Timeline só APÓS o filtro de duração — dela saem as botas compradas.
                                 timeline = chamada_api(f"https://{macro_regiao}.api.riotgames.com/lol/match/v5/matches/{m_id}/timeline")
 
+                                # Normal/flex: elo REAL de cada jogador (lookup por puuid, cacheado);
+                                # solo: mapa=None → divisão padrão "I" do semente apex.
+                                mapa_ranks = construir_mapa_ranks(data, servidor, fila, chamada_api, RANKS)
+
                                 # Rota inferida + sinais crus + fila + botas; divisão padrão "I" no apex.
-                                inserir_partida(cursor, data, m_id, servidor, elo, "I", fila=fila, timeline=timeline)
+                                inserir_partida(cursor, data, m_id, servidor, elo, "I", fila=fila,
+                                                timeline=timeline, elo_por_puuid=mapa_ranks)
 
                                 cursor.execute("INSERT INTO partidas_processadas VALUES (?)", (m_id,))
                                 conn.commit()
                                 partidas_coletadas += 1
-                                print(f"   ✅ [{servidor.upper()} - {elo} {fila}] Coletadas: {partidas_coletadas}/{META_PARTIDAS_POR_ELO}")
+                                print(f"   ✅ [{servidor.upper()} - {elo} {fila}] Coletadas: {partidas_coletadas}/{meta_fila}")
                                 # pace por requisição é central (PACER.aguardar em chamada_api)
             
             print(f"\n✅ Ciclo {ciclo} High Elo concluído!")
@@ -222,6 +240,7 @@ def iniciar_crawler_apex():
         print("\n\n🛑 Comando de Interrupção (Ctrl+C) recebido do teclado!")
         print("🛑 Finalizando as operações pendentes com segurança...")
     finally:
+        RANKS.salvar()  # persiste o cache de ranks acumulado
         conn.close()
         print("💾 Conexão com o banco de dados encerrada. Dados salvos com sucesso!")
 

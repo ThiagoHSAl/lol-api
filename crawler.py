@@ -6,6 +6,7 @@ import random
 from dotenv import load_dotenv
 from ingest_crawler import garantir_colunas, inserir_partida  # rota inferida + sinais crus
 from riot_pacer import RiotPacer
+from ranks import RankCache, construir_mapa_ranks  # elo por jogador na normal/flex
 
 # ==========================================
 # 1. CARREGAMENTO INICIAL DA CHAVE
@@ -52,7 +53,19 @@ REGIOES = {
 
 ELOS = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND']
 DIVISOES = ['IV', 'III', 'II', 'I']
-PARTIDAS_POR_SUBELO = 50 
+PARTIDAS_POR_SUBELO = 50
+
+# Meta MENOR em normal/flex: cada partida dessas filas custa ~10 lookups de rank
+# (league-v4/by-puuid) além de match+timeline. Coletar menos por sub-elo mantém o
+# gasto de API sob controle. Configurável por META_FLEX / META_NORMAL no .env.
+META_POR_FILA = {
+    "solo": PARTIDAS_POR_SUBELO,
+    "flex": int(os.getenv("META_FLEX", "25")),
+    "normal": int(os.getenv("META_NORMAL", "25")),
+}
+
+# Cache PERSISTENTE de rank por jogador (arquivo próprio da dev key 1).
+RANKS = RankCache(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ranks_dev1.json"))
 
 # ==========================================
 # 3. BANCO DE DADOS (EXPANSÃO MÁXIMA)
@@ -201,11 +214,12 @@ def iniciar_crawler():
                         random.shuffle(jogadores)
 
                         for fila, queue_id in FILAS.items():
-                            print(f"\n🌟 [{servidor.upper()}] {elo} {div} | fila={fila}")
+                            meta_fila = META_POR_FILA.get(fila, PARTIDAS_POR_SUBELO)
+                            print(f"\n🌟 [{servidor.upper()}] {elo} {div} | fila={fila} (Meta: {meta_fila})")
                             partidas = 0
 
                             for j in jogadores:
-                                if partidas >= PARTIDAS_POR_SUBELO: break
+                                if partidas >= meta_fila: break
 
                                 puuid = j.get('puuid')
                                 if not puuid: continue
@@ -214,7 +228,7 @@ def iniciar_crawler():
                                 if not match_ids: continue
 
                                 for m_id in match_ids:
-                                    if partidas >= PARTIDAS_POR_SUBELO: break
+                                    if partidas >= meta_fila: break
 
                                     if cursor.execute("SELECT 1 FROM partidas_processadas WHERE match_id = ?", (m_id,)).fetchone(): continue
 
@@ -225,13 +239,18 @@ def iniciar_crawler():
                                     # partida curta descartada). Dela saem as botas realmente compradas.
                                     timeline = chamada_api(f"https://{macro_regiao}.api.riotgames.com/lol/match/v5/matches/{m_id}/timeline")
 
+                                    # Normal/flex: elo REAL de cada jogador (lookup por puuid, cacheado);
+                                    # solo: mapa=None → mantém o rótulo do semente.
+                                    mapa_ranks = construir_mapa_ranks(data, servidor, fila, chamada_api, RANKS)
+
                                     # Rota inferida + sinais crus + fila + botas da timeline.
-                                    inserir_partida(cursor, data, m_id, servidor, elo, div, fila=fila, timeline=timeline)
+                                    inserir_partida(cursor, data, m_id, servidor, elo, div, fila=fila,
+                                                    timeline=timeline, elo_por_puuid=mapa_ranks)
 
                                     cursor.execute("INSERT INTO partidas_processadas VALUES (?)", (m_id,))
                                     conn.commit()
                                     partidas += 1
-                                    print(f"   ✅ [{servidor.upper()} - {elo} {div} {fila}] Coletadas: {partidas}/{PARTIDAS_POR_SUBELO}")
+                                    print(f"   ✅ [{servidor.upper()} - {elo} {div} {fila}] Coletadas: {partidas}/{meta_fila}")
                                     # pace por requisição é central (PACER.aguardar em chamada_api)
             
             print(f"\n✅ Ciclo {ciclo} concluído em todas as regiões!")
@@ -243,6 +262,7 @@ def iniciar_crawler():
         print("\n\n🛑 Comando de Interrupção (Ctrl+C) recebido do teclado!")
         print("🛑 Finalizando as operações pendentes com segurança...")
     finally:
+        RANKS.salvar()  # persiste o cache de ranks acumulado
         conn.close()
         print("💾 Conexão com o banco de dados encerrada. Dados salvos com sucesso!")
 
