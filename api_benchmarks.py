@@ -555,6 +555,9 @@ def obter_panorama_meta(elo: str, fila: Optional[str] = None):
     elo = elo.upper()
     fila = _validar_fila(fila)
     elos_validos = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"]
+    # UNRANKED só existe na fila normal (jogadores sem rank solo/duo).
+    if fila == "normal":
+        elos_validos = elos_validos + ["UNRANKED"]
 
     if elo not in elos_validos:
         raise HTTPException(status_code=400, detail="Elo inválido.")
