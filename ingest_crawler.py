@@ -33,9 +33,14 @@ COLUNAS_NOVAS = [
     # botas_compradas: IDs de bota comprados na timeline, em ordem. Corrige o top_2_botas
     # (o inventário final quase nunca tem bota — vendida no late; ver a investigação de 08/07).
     ("botas_compradas", "TEXT"),        # NULL para dados antigos (sem timeline)
+    # Guia do Campeão (Fase 1): saem de graça do que o crawler já baixa — runas do
+    # participant.perks (match) e ordem de skill dos SKILL_LEVEL_UP (timeline já buscada
+    # para as botas). NULL para dados antigos (degradação segura, como botas_compradas).
+    ("runas", "TEXT"),                  # JSON: estilos + seleções + shards
+    ("ordem_skill", "TEXT"),            # sequência de skills (ex.: 'QWEQ...')
 ]
 
-# 31 colunas originais + 11 novas = 42
+# 31 colunas originais + 13 novas = 44
 _COLUNAS_INSERT = (
     "match_id, regiao, elo, divisao, campeao, posicao, vitoria, "
     "kda, cs_min, ouro_min, visao_min, dano_min, itens, "
@@ -44,11 +49,11 @@ _COLUNAS_INSERT = (
     "pings_perigo, pings_ajuda, pings_mia, "
     "kpa, skillshots_desviadas, solo_kills, cs_jungle_10m, cs_rota_10m, pct_dano_time, "
     "puuid, team_id, team_position, individual_position, lane, role, summoner1_id, summoner2_id, posicao_apoio, "
-    "fila, botas_compradas"
+    "fila, botas_compradas, runas, ordem_skill"
 )
 _SQL_INSERT = (
     f"INSERT INTO estatisticas_meta ({_COLUNAS_INSERT}) VALUES ("
-    + ",".join(["?"] * 42) + ")"
+    + ",".join(["?"] * 44) + ")"
 )
 
 # ---------------------------------------------------------------------------
@@ -95,6 +100,48 @@ def _botas_por_participante(timeline: dict) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Guia do Campeão (Fase 1): runas (do match) e ordem de skill (da timeline).
+# ---------------------------------------------------------------------------
+# Slot da timeline -> letra da skill. Não há um slot "P" (passiva não sobe nível).
+_SLOT_SKILL = {1: "Q", 2: "W", 3: "E", 4: "R"}
+
+
+def _runas_de_participante(p: dict) -> str | None:
+    """Serializa `p['perks']` (Match-V5) num JSON compacto com estilo primário/secundário,
+    as seleções (IDs das runas) de cada árvore e os 3 stat shards. NULL se ausente
+    (dados antigos ou partida sem perks) — degradação segura como botas_compradas."""
+    perks = p.get("perks") or {}
+    styles = perks.get("styles") or []
+    primaria = next((s for s in styles if s.get("description") == "primaryStyle"), None)
+    secundaria = next((s for s in styles if s.get("description") == "subStyle"), None)
+    if not primaria or not secundaria:
+        return None
+    stats = perks.get("statPerks") or {}
+    dados = {
+        "estilo_primario": primaria.get("style"),
+        "estilo_secundario": secundaria.get("style"),
+        "primarias": [sel.get("perk") for sel in primaria.get("selections", [])],
+        "secundarias": [sel.get("perk") for sel in secundaria.get("selections", [])],
+        "shards": [stats.get("offense"), stats.get("flex"), stats.get("defense")],
+    }
+    return json.dumps(dados, separators=(",", ":"))
+
+
+def _ordem_skill(timeline: dict) -> dict:
+    """participantId (1-10) -> string da sequência de skills na ordem em que foram subidas
+    (ex.: 'QWEQQRQ...'). Lê os SKILL_LEVEL_UP da timeline da Match-V5. Ignora EVOLVE
+    (Kha'Zix/Viktor evoluem sem gastar ponto de nível), contando só os NORMAL."""
+    out: dict = {}
+    for frame in (timeline or {}).get("info", {}).get("frames", []):
+        for ev in frame.get("events", []):
+            if ev.get("type") == "SKILL_LEVEL_UP" and ev.get("levelUpType") == "NORMAL":
+                letra = _SLOT_SKILL.get(ev.get("skillSlot"))
+                if letra:
+                    out.setdefault(ev.get("participantId"), []).append(letra)
+    return {pid: "".join(seq) for pid, seq in out.items()}
+
+
 def garantir_colunas(conn):
     """Adiciona as colunas de sinais crus se ainda não existirem (idempotente)."""
     existentes = {r[1] for r in conn.execute("PRAGMA table_info(estatisticas_meta)")}
@@ -105,8 +152,8 @@ def garantir_colunas(conn):
 
 
 def linha_participante(p: dict, m_id, servidor, elo, div, posicao, apoio, duracao_min,
-                       fila, botas_str) -> tuple:
-    """Constrói a tupla de 42 valores de UM participante (ordem de _SQL_INSERT)."""
+                       fila, botas_str, runas_str, ordem_skill_str) -> tuple:
+    """Constrói a tupla de 44 valores de UM participante (ordem de _SQL_INSERT)."""
     kda = (p["kills"] + p["assists"]) / max(1, p["deaths"])
     cs = p.get("totalMinionsKilled", 0) + p.get("neutralMinionsKilled", 0)
     dano = p.get("totalDamageDealtToChampions", 0)
@@ -133,8 +180,8 @@ def linha_participante(p: dict, m_id, servidor, elo, div, posicao, apoio, duraca
         # Sinais crus (novas colunas) — para re-derivação futura sem re-fetch
         p.get("puuid"), p.get("teamId"), p.get("teamPosition"), p.get("individualPosition"),
         p.get("lane"), p.get("role"), p.get("summoner1Id"), p.get("summoner2Id"), apoio,
-        # Fila e botas compradas (da timeline)
-        fila, botas_str,
+        # Fila, botas compradas (da timeline), runas (do match) e ordem de skill (da timeline)
+        fila, botas_str, runas_str, ordem_skill_str,
     )
 
 
@@ -157,6 +204,7 @@ def inserir_partida(cursor, data: dict, m_id, servidor, elo, div,
     duracao_min = info["gameDuration"] / 60.0
     rotas = inferir_rotas_partida(info)
     botas_map = _botas_por_participante(timeline) if timeline else {}
+    skill_map = _ordem_skill(timeline) if timeline else {}
     inseridos = descartados = 0
     for p in info["participants"]:
         # Elo por jogador (normal/flex) ou rótulo do semente (solo/apex).
@@ -175,10 +223,12 @@ def inserir_partida(cursor, data: dict, m_id, servidor, elo, div,
             continue  # rota indeduzível (swap/autofill ambíguo) → fora do dataset
         botas_ids = botas_map.get(p.get("participantId"))
         botas_str = ",".join(botas_ids) if botas_ids else None
+        runas_str = _runas_de_participante(p)
+        ordem_skill_str = skill_map.get(p.get("participantId")) or None
         cursor.execute(
             _SQL_INSERT,
             linha_participante(p, m_id, servidor, elo_p, div_p, inf["rota"], inf.get("apoio"),
-                               duracao_min, fila, botas_str),
+                               duracao_min, fila, botas_str, runas_str, ordem_skill_str),
         )
         inseridos += 1
     return inseridos, descartados
