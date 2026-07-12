@@ -2,6 +2,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Query
 import sqlite3
 import requests
 from functools import lru_cache
+from collections import Counter
 import json
 import os
 import time
@@ -579,3 +580,224 @@ def obter_panorama_meta(elo: str, fila: Optional[str] = None):
 
     except Exception as e:
          raise HTTPException(status_code=500, detail=f"Erro ao ler cache: {str(e)}")
+
+
+# ==========================================
+# GUIA DO CAMPEÃO (Fase 2) — agregação por campeão/rota/elo
+# ==========================================
+# Build/botas/feitiços/runas/ordem de skill são MODAIS lidos AO VIVO de estatisticas_meta
+# (a tabela pré-agregada só guarda somas de métricas). O índice composto idx_camp_pos_upper
+# (UPPER(campeao),UPPER(posicao),elo,divisao) faz cada consulta tocar só a partição do
+# campeão/rota/elo — rápido mesmo com ~4M linhas. As métricas-alvo reaproveitam a tabela
+# agregada via _bench_por_campeoes. Runas e ordem de skill só existem em linhas novas
+# (Fase 1): reportam a PRÓPRIA amostra (linhas não-nulas) e degradam a null enquanto ralas.
+
+LIMIAR_ROTA_GUIA = 20    # rota só entra no seletor de rota com amostra mínima
+LIMIAR_GUIA_OK = 30      # abaixo disso o guia marca base_degradada=True
+
+
+@lru_cache(maxsize=1)
+def _mapa_itens_finais_guia() -> dict:
+    """id->nome dos itens FINAIS de build (inclui botas), mesmas regras do atualizador
+    (obter_mapa_de_itens_finais). Reusa o backup local escrito pelo atualizador."""
+    backup = "backup_itens_finais.json"
+    try:
+        versao = obter_versao_mais_recente()
+        dados = requests.get(
+            f"https://ddragon.leagueoflegends.com/cdn/{versao}/data/pt_BR/item.json", timeout=10
+        ).json()["data"]
+        mapa = {}
+        for iid, d in dados.items():
+            if "into" in d:
+                continue
+            tags = d.get("tags", [])
+            if "Consumable" in tags or "Trinket" in tags or "Vision" in tags:
+                continue
+            custo = d.get("gold", {}).get("total", 0)
+            if custo >= 1500 or ("Boots" in tags and custo > 500):
+                mapa[iid] = d["name"]
+        return mapa
+    except Exception:
+        if os.path.exists(backup):
+            with open(backup) as f:
+                return json.load(f)
+        return {}
+
+
+@lru_cache(maxsize=1)
+def _mapa_botas_guia() -> dict:
+    """id->nome só das botas tier-2+ (custo > 500), como no atualizador (obter_mapa_botas)."""
+    backup = "backup_botas.json"
+    try:
+        versao = obter_versao_mais_recente()
+        dados = requests.get(
+            f"https://ddragon.leagueoflegends.com/cdn/{versao}/data/pt_BR/item.json", timeout=10
+        ).json()["data"]
+        mapa = {
+            iid: d["name"] for iid, d in dados.items()
+            if "Boots" in d.get("tags", []) and d.get("gold", {}).get("total", 0) > 500
+        }
+        return mapa
+    except Exception:
+        if os.path.exists(backup):
+            with open(backup) as f:
+                return json.load(f)
+        return {}
+
+
+def _metricas_campeao_elo(campeao: str, posicao: str, elo: str, fila: str, regiao: Optional[str]) -> Optional[dict]:
+    """Métricas-alvo do campeão na rota, para UM elo (média das divisões I..IV; apex ignora
+    divisão). Vem da tabela agregada via _bench_por_campeoes. None se sem amostra."""
+    bench = _bench_por_campeoes(posicao, [campeao], regiao, fila)
+    elo = elo.upper()
+    if elo in ("MASTER", "GRANDMASTER", "CHALLENGER", "UNRANKED"):
+        return bench.get(f"{elo}_I")
+    blocos = [bench[f"{elo}_{d}"] for d in ("I", "II", "III", "IV") if f"{elo}_{d}" in bench]
+    if not blocos:
+        return None
+    media = {}
+    for m in blocos[0].keys():
+        vals = [b[m] for b in blocos if isinstance(b.get(m), (int, float))]
+        if vals:
+            media[m] = round(sum(vals) / len(vals), 4)
+    return media
+
+
+def _agregar_guia(campeao: str, posicao: str, elo: str, fila: str, regiao: Optional[str]) -> dict:
+    """Modais de build/botas/feitiços/runas/ordem de skill do campeão numa rota+elo+fila.
+    Lê a partição direto de estatisticas_meta (índice idx_camp_pos_upper)."""
+    itens_finais = _mapa_itens_finais_guia()
+    botas_nomes = _mapa_botas_guia()
+
+    where = "UPPER(campeao)=UPPER(?) AND UPPER(posicao)=UPPER(?) AND elo=?"
+    params = [campeao, posicao, elo.upper()]
+    if regiao:
+        where += " AND UPPER(regiao)=UPPER(?)"
+        params.append(regiao)
+    where += " AND COALESCE(fila,'solo')=?"
+    params.append(fila)
+
+    conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        linhas = conn.execute(
+            f"""SELECT itens, botas_compradas, summoner1_id, summoner2_id, runas, ordem_skill
+                FROM estatisticas_meta WHERE {where}""",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    amostra = len(linhas)
+    if amostra == 0:
+        return {"campeao": campeao, "posicao": posicao, "elo": elo.upper(), "fila": fila, "amostra": 0}
+
+    c_itens, c_botas, c_feit, c_runas, c_skill = Counter(), Counter(), Counter(), Counter(), Counter()
+    pos_skill = {"Q": [], "W": [], "E": []}   # índices de level-up p/ prioridade de maximização
+    n_runas = n_skill = 0
+
+    for l in linhas:
+        # Itens core: inventário final, exclui botas (têm ranking próprio) e itens não-finais.
+        itens_str = l["itens"]
+        itens_ids = []
+        if itens_str:
+            itens_ids = json.loads(itens_str) if "[" in itens_str else itens_str.split(",")
+            itens_ids = [str(i).strip() for i in itens_ids]
+            for iid in itens_ids:
+                if iid in itens_finais and iid not in botas_nomes:
+                    c_itens[iid] += 1
+        # Botas: preferimos as COMPRADAS (timeline); linha antiga cai p/ inventário final.
+        botas_str = l["botas_compradas"]
+        botas_ids = [b.strip() for b in botas_str.split(",")] if botas_str else itens_ids
+        for iid in botas_ids:
+            if iid in botas_nomes:
+                c_botas[iid] += 1
+        # Feitiços de invocador: par não-ordenado.
+        s1, s2 = l["summoner1_id"], l["summoner2_id"]
+        if s1 and s2:
+            c_feit[tuple(sorted((s1, s2)))] += 1
+        # Runas (Fase 1): página exata mais comum, sobre a própria amostra não-nula.
+        if l["runas"]:
+            c_runas[l["runas"]] += 1
+            n_runas += 1
+        # Ordem de skill (Fase 1): sequência modal + prioridade de maximização Q/W/E.
+        skl = l["ordem_skill"]
+        if skl:
+            n_skill += 1
+            c_skill[skl] += 1
+            for idx, ch in enumerate(skl):
+                if ch in pos_skill:
+                    pos_skill[ch].append(idx)
+
+    def _pct(c):
+        return round(c / amostra * 100, 1)
+
+    itens = [{"id": i, "nome": itens_finais[i], "uso_pct": _pct(c)} for i, c in c_itens.most_common(6)]
+    botas = [{"id": i, "nome": botas_nomes[i], "uso_pct": _pct(c)} for i, c in c_botas.most_common(3)]
+    feiticos = [{"ids": list(par), "uso_pct": _pct(c)} for par, c in c_feit.most_common(3)]
+
+    runas = None
+    if n_runas:
+        rstr, rc = c_runas.most_common(1)[0]
+        runas = {"pagina": json.loads(rstr), "uso_pct": round(rc / n_runas * 100, 1), "amostra": n_runas}
+
+    ordem_skill = None
+    if n_skill:
+        seq, sc = c_skill.most_common(1)[0]
+        prioridade = [k for k in sorted(("Q", "W", "E"),
+                                        key=lambda k: sum(pos_skill[k]) / len(pos_skill[k]) if pos_skill[k] else 99)
+                      if pos_skill[k]]
+        ordem_skill = {"sequencia_modal": seq, "uso_pct": round(sc / n_skill * 100, 1),
+                       "prioridade": prioridade, "amostra": n_skill}
+
+    return {
+        "campeao": campeao, "posicao": posicao, "elo": elo.upper(), "fila": fila,
+        "amostra": amostra, "base_degradada": amostra < LIMIAR_GUIA_OK,
+        "build": {"itens": itens, "botas": botas},
+        "feiticos": feiticos, "runas": runas, "ordem_skill": ordem_skill,
+    }
+
+
+@app.get("/guia-campeao/{campeao}/rotas")
+def guia_campeao_rotas(campeao: str, regiao: Optional[str] = None, fila: Optional[str] = None):
+    """Rotas em que o campeão tem amostra relevante (para o front decidir o seletor de rota)
+    + a rota mais comum (padrão). `?fila=solo|flex|normal` (default solo)."""
+    fila = _validar_fila(fila)
+    where = "UPPER(campeao)=UPPER(?)"
+    params = [campeao]
+    if regiao:
+        where += " AND UPPER(regiao)=UPPER(?)"
+        params.append(regiao)
+    where += " AND COALESCE(fila,'solo')=?"
+    params.append(fila)
+
+    conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        linhas = conn.execute(
+            f"SELECT posicao, COUNT(*) AS n FROM estatisticas_meta WHERE {where} GROUP BY posicao ORDER BY n DESC",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    rotas = [{"posicao": r["posicao"], "amostra": r["n"]}
+             for r in linhas if r["posicao"] and r["n"] >= LIMIAR_ROTA_GUIA]
+    if not rotas:
+        raise HTTPException(status_code=404, detail="Amostra insuficiente para esse campeão nessa fila.")
+    return {"campeao": campeao, "fila": fila, "rota_padrao": rotas[0]["posicao"], "rotas": rotas}
+
+
+@app.get("/guia-campeao/{campeao}/{posicao}")
+def guia_campeao(campeao: str, posicao: str, elo: str = Query(..., description="Elo (tier), ex.: GOLD"),
+                 regiao: Optional[str] = None, fila: Optional[str] = None):
+    """Guia de UM campeão numa rota+elo+fila: build/botas/feitiços/runas/ordem de skill modais
+    + métricas-alvo + amostra. Para o comparativo dual-elo, o front chama duas vezes (elo atual
+    e elo acima). `?fila=solo|flex|normal` (default solo)."""
+    posicao = _validar_posicao(posicao)
+    fila = _validar_fila(fila)
+    dados = _agregar_guia(campeao, posicao, elo, fila, regiao)
+    if dados["amostra"] == 0:
+        raise HTTPException(status_code=404, detail="Sem dados para esse campeão/rota/elo/fila.")
+    dados["metricas"] = _metricas_campeao_elo(campeao, posicao, elo, fila, regiao)
+    return dados
