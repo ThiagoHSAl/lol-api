@@ -38,9 +38,12 @@ COLUNAS_NOVAS = [
     # para as botas). NULL para dados antigos (degradação segura, como botas_compradas).
     ("runas", "TEXT"),                  # JSON: estilos + seleções + shards
     ("ordem_skill", "TEXT"),            # sequência de skills (ex.: 'QWEQ...')
+    # Build inicial (de lane): itens comprados na saída da base (antes dos minions), da
+    # timeline. NULL para dados antigos (degradação segura, como as colunas acima).
+    ("itens_iniciais", "TEXT"),         # IDs (ordenados) do set inicial, ex.: '1055,2003,2003'
 ]
 
-# 31 colunas originais + 13 novas = 44
+# 31 colunas originais + 14 novas = 45
 _COLUNAS_INSERT = (
     "match_id, regiao, elo, divisao, campeao, posicao, vitoria, "
     "kda, cs_min, ouro_min, visao_min, dano_min, itens, "
@@ -49,11 +52,11 @@ _COLUNAS_INSERT = (
     "pings_perigo, pings_ajuda, pings_mia, "
     "kpa, skillshots_desviadas, solo_kills, cs_jungle_10m, cs_rota_10m, pct_dano_time, "
     "puuid, team_id, team_position, individual_position, lane, role, summoner1_id, summoner2_id, posicao_apoio, "
-    "fila, botas_compradas, runas, ordem_skill"
+    "fila, botas_compradas, runas, ordem_skill, itens_iniciais"
 )
 _SQL_INSERT = (
     f"INSERT INTO estatisticas_meta ({_COLUNAS_INSERT}) VALUES ("
-    + ",".join(["?"] * 44) + ")"
+    + ",".join(["?"] * 45) + ")"
 )
 
 # ---------------------------------------------------------------------------
@@ -142,6 +145,33 @@ def _ordem_skill(timeline: dict) -> dict:
     return {pid: "".join(seq) for pid, seq in out.items()}
 
 
+# Limite de tempo (ms) para considerar uma compra como "build inicial": itens comprados
+# ainda na base, antes de os minions se encontrarem (~1min). Um 1º retorno à base acontece
+# bem depois, então esse corte pega só a compra de abertura (Doran, poções, tear, cull...).
+_MS_BUILD_INICIAL = 60000
+
+
+def _itens_iniciais_por_participante(timeline: dict) -> dict:
+    """participantId (1-10) -> lista de IDs comprados na saída da base (timestamp < ~1min),
+    em ordem de compra. Trata ITEM_UNDO (desfazer compra) removendo o último item igual.
+    Trinkets/wards de início são gratuitos (não geram ITEM_PURCHASED), então ficam de fora."""
+    out: dict = {}
+    for frame in (timeline or {}).get("info", {}).get("frames", []):
+        for ev in frame.get("events", []):
+            if ev.get("timestamp", 0) >= _MS_BUILD_INICIAL:
+                continue
+            tipo = ev.get("type")
+            if tipo == "ITEM_PURCHASED":
+                out.setdefault(ev.get("participantId"), []).append(str(ev.get("itemId")))
+            elif tipo == "ITEM_UNDO":  # desfez a compra: remove o item devolvido
+                lst = out.get(ev.get("participantId"))
+                alvo = str(ev.get("beforeId"))
+                if lst and alvo in lst:
+                    lst.remove(alvo)
+    # Ordena os IDs para canonizar o "set inicial" (a modal do agregado fica estável).
+    return {pid: sorted(ids) for pid, ids in out.items() if ids}
+
+
 def garantir_colunas(conn):
     """Adiciona as colunas de sinais crus se ainda não existirem (idempotente)."""
     existentes = {r[1] for r in conn.execute("PRAGMA table_info(estatisticas_meta)")}
@@ -152,8 +182,8 @@ def garantir_colunas(conn):
 
 
 def linha_participante(p: dict, m_id, servidor, elo, div, posicao, apoio, duracao_min,
-                       fila, botas_str, runas_str, ordem_skill_str) -> tuple:
-    """Constrói a tupla de 44 valores de UM participante (ordem de _SQL_INSERT)."""
+                       fila, botas_str, runas_str, ordem_skill_str, itens_iniciais_str) -> tuple:
+    """Constrói a tupla de 45 valores de UM participante (ordem de _SQL_INSERT)."""
     kda = (p["kills"] + p["assists"]) / max(1, p["deaths"])
     cs = p.get("totalMinionsKilled", 0) + p.get("neutralMinionsKilled", 0)
     dano = p.get("totalDamageDealtToChampions", 0)
@@ -180,8 +210,8 @@ def linha_participante(p: dict, m_id, servidor, elo, div, posicao, apoio, duraca
         # Sinais crus (novas colunas) — para re-derivação futura sem re-fetch
         p.get("puuid"), p.get("teamId"), p.get("teamPosition"), p.get("individualPosition"),
         p.get("lane"), p.get("role"), p.get("summoner1Id"), p.get("summoner2Id"), apoio,
-        # Fila, botas compradas (da timeline), runas (do match) e ordem de skill (da timeline)
-        fila, botas_str, runas_str, ordem_skill_str,
+        # Fila, botas/build inicial (da timeline), runas (do match) e ordem de skill (da timeline)
+        fila, botas_str, runas_str, ordem_skill_str, itens_iniciais_str,
     )
 
 
@@ -205,6 +235,7 @@ def inserir_partida(cursor, data: dict, m_id, servidor, elo, div,
     rotas = inferir_rotas_partida(info)
     botas_map = _botas_por_participante(timeline) if timeline else {}
     skill_map = _ordem_skill(timeline) if timeline else {}
+    iniciais_map = _itens_iniciais_por_participante(timeline) if timeline else {}
     inseridos = descartados = 0
     for p in info["participants"]:
         # Elo por jogador (normal/flex) ou rótulo do semente (solo/apex).
@@ -225,10 +256,13 @@ def inserir_partida(cursor, data: dict, m_id, servidor, elo, div,
         botas_str = ",".join(botas_ids) if botas_ids else None
         runas_str = _runas_de_participante(p)
         ordem_skill_str = skill_map.get(p.get("participantId")) or None
+        iniciais_ids = iniciais_map.get(p.get("participantId"))
+        iniciais_str = ",".join(iniciais_ids) if iniciais_ids else None
         cursor.execute(
             _SQL_INSERT,
             linha_participante(p, m_id, servidor, elo_p, div_p, inf["rota"], inf.get("apoio"),
-                               duracao_min, fila, botas_str, runas_str, ordem_skill_str),
+                               duracao_min, fila, botas_str, runas_str, ordem_skill_str,
+                               iniciais_str),
         )
         inseridos += 1
     return inseridos, descartados

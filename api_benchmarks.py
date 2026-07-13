@@ -663,11 +663,23 @@ def _metricas_campeao_elo(campeao: str, posicao: str, elo: str, fila: str, regia
     return media
 
 
+@lru_cache(maxsize=1)
+def _colunas_meta() -> frozenset:
+    """Colunas de estatisticas_meta (para degradar quando uma coluna nova — ex.: itens_iniciais
+    — ainda não existe no DB, antes do re-crawl que a adiciona via garantir_colunas)."""
+    conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
+    try:
+        return frozenset(r[1] for r in conn.execute("PRAGMA table_info(estatisticas_meta)"))
+    finally:
+        conn.close()
+
+
 def _agregar_guia(campeao: str, posicao: str, elo: str, fila: str, regiao: Optional[str]) -> dict:
-    """Modais de build/botas/feitiços/runas/ordem de skill do campeão numa rota+elo+fila.
-    Lê a partição direto de estatisticas_meta (índice idx_camp_pos_upper)."""
+    """Modais de build inicial/core/botas/feitiços/runas/ordem de skill do campeão numa
+    rota+elo+fila. Lê a partição direto de estatisticas_meta (índice idx_camp_pos_upper)."""
     itens_finais = _mapa_itens_finais_guia()
     botas_nomes = _mapa_botas_guia()
+    tem_inicial = "itens_iniciais" in _colunas_meta()   # coluna nova (forward-only)
 
     where = "UPPER(campeao)=UPPER(?) AND UPPER(posicao)=UPPER(?) AND elo=?"
     params = [campeao, posicao, elo.upper()]
@@ -677,11 +689,12 @@ def _agregar_guia(campeao: str, posicao: str, elo: str, fila: str, regiao: Optio
     where += " AND COALESCE(fila,'solo')=?"
     params.append(fila)
 
+    sel_inicial = ", itens_iniciais" if tem_inicial else ""
     conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         linhas = conn.execute(
-            f"""SELECT itens, botas_compradas, summoner1_id, summoner2_id, runas, ordem_skill
+            f"""SELECT itens, botas_compradas, summoner1_id, summoner2_id, runas, ordem_skill{sel_inicial}
                 FROM estatisticas_meta WHERE {where}""",
             params,
         ).fetchall()
@@ -693,10 +706,15 @@ def _agregar_guia(campeao: str, posicao: str, elo: str, fila: str, regiao: Optio
         return {"campeao": campeao, "posicao": posicao, "elo": elo.upper(), "fila": fila, "amostra": 0}
 
     c_itens, c_botas, c_feit, c_runas, c_skill = Counter(), Counter(), Counter(), Counter(), Counter()
+    c_inicial = Counter()
     pos_skill = {"Q": [], "W": [], "E": []}   # índices de level-up p/ prioridade de maximização
-    n_runas = n_skill = 0
+    n_runas = n_skill = n_inicial = 0
 
     for l in linhas:
+        # Build inicial (de lane): set exato mais comum, sobre a própria amostra não-nula.
+        if tem_inicial and l["itens_iniciais"]:
+            c_inicial[l["itens_iniciais"]] += 1
+            n_inicial += 1
         # Itens core: inventário final, exclui botas (têm ranking próprio) e itens não-finais.
         itens_str = l["itens"]
         itens_ids = []
@@ -750,10 +768,16 @@ def _agregar_guia(campeao: str, posicao: str, elo: str, fila: str, regiao: Optio
         ordem_skill = {"sequencia_modal": seq, "uso_pct": round(sc / n_skill * 100, 1),
                        "prioridade": prioridade, "amostra": n_skill}
 
+    inicial = None
+    if n_inicial:
+        s, cnt = c_inicial.most_common(1)[0]
+        inicial = {"itens": s.split(","), "uso_pct": round(cnt / n_inicial * 100, 1),
+                   "amostra": n_inicial}
+
     return {
         "campeao": campeao, "posicao": posicao, "elo": elo.upper(), "fila": fila,
         "amostra": amostra, "base_degradada": amostra < LIMIAR_GUIA_OK,
-        "build": {"itens": itens, "botas": botas},
+        "build": {"inicial": inicial, "itens": itens, "botas": botas},
         "feiticos": feiticos, "runas": runas, "ordem_skill": ordem_skill,
     }
 
