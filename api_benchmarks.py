@@ -801,3 +801,67 @@ def guia_campeao(campeao: str, posicao: str, elo: str = Query(..., description="
         raise HTTPException(status_code=404, detail="Sem dados para esse campeão/rota/elo/fila.")
     dados["metricas"] = _metricas_campeao_elo(campeao, posicao, elo, fila, regiao)
     return dados
+
+
+# Mínimo de jogos por confronto (par campeão×oponente na rota) para entrar no ranking.
+LIMIAR_CONFRONTO = 20
+
+
+def _confrontos_campeao(campeao: str, posicao: str, elo: str, fila: str, regiao: Optional[str]) -> list:
+    """Win rate do campeão contra cada OPONENTE DE ROTA, no elo/fila. O oponente sai de um
+    self-join em estatisticas_meta: mesma partida (match_id), mesma rota (posicao), time
+    adversário (team_id diferente) — sem coleta nova, os dois lados já estão no DB. Lista de
+    {campeao, jogos, winrate} ordenada por winrate crescente; só pares com >= LIMIAR_CONFRONTO."""
+    where_a = ("UPPER(a.campeao)=UPPER(?) AND UPPER(a.posicao)=UPPER(?) "
+               "AND a.elo=? AND COALESCE(a.fila,'solo')=?")
+    params = [campeao, posicao, elo.upper(), fila]
+    if regiao:
+        where_a += " AND UPPER(a.regiao)=UPPER(?)"
+        params.append(regiao)
+    query = f"""
+        SELECT b.campeao AS oponente, COUNT(*) AS jogos, AVG(a.vitoria) AS wr
+        FROM estatisticas_meta a
+        JOIN estatisticas_meta b
+          ON a.match_id = b.match_id AND a.posicao = b.posicao AND a.team_id <> b.team_id
+        WHERE {where_a}
+        GROUP BY b.campeao
+        HAVING jogos >= ?
+    """
+    params.append(LIMIAR_CONFRONTO)
+    conn = sqlite3.connect("file:meu_meta_dataset_global.db?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+    confrontos = [{"campeao": r["oponente"], "jogos": r["jogos"],
+                   "winrate": round(r["wr"] * 100, 1)} for r in rows]
+    confrontos.sort(key=lambda x: x["winrate"])
+    return confrontos
+
+
+@app.get("/guia-campeao/{campeao}/{posicao}/confrontos")
+def guia_campeao_confrontos(campeao: str, posicao: str,
+                            elo: str = Query(..., description="Elo (tier), ex.: GOLD"),
+                            fila: Optional[str] = None, regiao: Optional[str] = None,
+                            limite: int = 5):
+    """Confrontos de rota do campeão por win rate (dado real do DB, sem re-crawl): os mais
+    fáceis (maior winrate) e os mais difíceis (menor winrate) no elo/fila. Alimenta a aba
+    Confrontos híbrida (o front cruza com o 'como jogar' gerado por LLM)."""
+    posicao = _validar_posicao(posicao)
+    fila = _validar_fila(fila)
+    confrontos = _confrontos_campeao(campeao, posicao, elo, fila, regiao)
+    if not confrontos:
+        raise HTTPException(status_code=404,
+                            detail="Sem amostra de confrontos para esse campeão/rota/elo.")
+    n = len(confrontos)
+    k = min(limite, n // 2)
+    if k == 0:  # um único confronto com amostra: classifica pelo winrate
+        unico = confrontos[0]
+        faceis = [unico] if unico["winrate"] >= 50 else []
+        dificeis = [] if unico["winrate"] >= 50 else [unico]
+    else:
+        dificeis = confrontos[:k]                    # menores winrates
+        faceis = list(reversed(confrontos[-k:]))     # maiores winrates
+    return {"campeao": campeao, "posicao": posicao, "elo": elo.upper(), "fila": fila,
+            "faceis": faceis, "dificeis": dificeis, "total_confrontos": n}
