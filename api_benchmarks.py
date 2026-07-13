@@ -594,6 +594,9 @@ def obter_panorama_meta(elo: str, fila: Optional[str] = None):
 
 LIMIAR_ROTA_GUIA = 20    # rota só entra no seletor de rota com amostra mínima
 LIMIAR_GUIA_OK = 30      # abaixo disso o guia marca base_degradada=True
+# Trinkets iniciais (ward de vigília gratuita e upgrades) — NÃO são compra de lane. Entram/somem
+# da timeline no início, fragmentando a build inicial modal; removemos antes de contar a modal.
+_TRINKETS_INICIAIS = {"3340", "3363", "3364"}
 
 
 @lru_cache(maxsize=1)
@@ -711,10 +714,13 @@ def _agregar_guia(campeao: str, posicao: str, elo: str, fila: str, regiao: Optio
     n_runas = n_skill = n_inicial = 0
 
     for l in linhas:
-        # Build inicial (de lane): set exato mais comum, sobre a própria amostra não-nula.
+        # Build inicial (de lane): set mais comum IGNORANDO a trinket inicial (que fragmentava
+        # a modal). IDs já vêm ordenados do crawler, então o set canônico segue ordenado.
         if tem_inicial and l["itens_iniciais"]:
-            c_inicial[l["itens_iniciais"]] += 1
-            n_inicial += 1
+            ids_ini = [i for i in l["itens_iniciais"].split(",") if i not in _TRINKETS_INICIAIS]
+            if ids_ini:
+                c_inicial[",".join(ids_ini)] += 1
+                n_inicial += 1
         # Itens core: inventário final, exclui botas (têm ranking próprio) e itens não-finais.
         itens_str = l["itens"]
         itens_ids = []
